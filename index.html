@@ -10506,7 +10506,7 @@
             }
         }
 
-        async function pushAuthDataToCloud(silent = true) {
+        async function pushAuthDataToCloud(silent = true, useKeepalive = false) {
             if (!yoplanoCloudDbUrl) return false;
             try {
                 const endpoint = `${yoplanoCloudDbUrl}/yoplano_auth_state.json`;
@@ -10519,7 +10519,8 @@
                 const res = await fetch(endpoint, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
+                    keepalive: !!useKeepalive
                 });
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 if (!silent) showToast('Data User & Riwayat Login berhasil disinkronkan ke Cloud!', 'fa-cloud-arrow-up', 'text-emerald-400');
@@ -10650,6 +10651,44 @@
             if (overlay) overlay.classList.add('hidden');
         }
 
+        let isYoPlanoPrinting = false;
+
+        function performAutoLogout(reasonMsg = '', useKeepalive = false) {
+            if (!sessionStorage.getItem('yoplano_tab_session_v1')) return;
+            if (currentUser) {
+                const nowStr = formatCurrentLoginTime();
+                const uIdx = yoplanoUsers.findIndex(u => u.id === currentUser.id);
+                if (uIdx !== -1) {
+                    yoplanoUsers[uIdx].isOnline = false;
+                    yoplanoUsers[uIdx].lastLogoutText = nowStr;
+                }
+                const activeLog = yoplanoLoginLogs.find(l => l.userId === currentUser.id && l.status === 'ONLINE');
+                if (activeLog) {
+                    activeLog.status = 'LOGOUT';
+                    activeLog.logoutTime = nowStr;
+                }
+                lastLocalAuthWriteTs = Date.now();
+                try {
+                    localStorage.setItem('yoplano_users_v2', JSON.stringify(yoplanoUsers));
+                    localStorage.setItem('yoplano_login_logs_v1', JSON.stringify(yoplanoLoginLogs));
+                } catch (e) {}
+                if (yoplanoCloudDbUrl) {
+                    pushAuthDataToCloud(true, useKeepalive);
+                }
+            }
+            try {
+                sessionStorage.removeItem('yoplano_tab_session_v1');
+                localStorage.removeItem('yoplano_session_active_v1');
+            } catch (e) {}
+            openLoginOverlay();
+            if (reasonMsg) {
+                const errBox = document.getElementById('loginErrorBox');
+                const errTxt = document.getElementById('loginErrorText');
+                if (errTxt) errTxt.textContent = reasonMsg;
+                if (errBox) errBox.classList.remove('hidden');
+            }
+        }
+
         async function handleLogout() {
             if (currentUser) {
                 const uIdx = yoplanoUsers.findIndex(u => u.id === currentUser.id);
@@ -10664,7 +10703,10 @@
                 }
                 saveAuthData(true);
             }
-            localStorage.removeItem('yoplano_session_active_v1');
+            try {
+                sessionStorage.removeItem('yoplano_tab_session_v1');
+                localStorage.removeItem('yoplano_session_active_v1');
+            } catch (e) {}
             openLoginOverlay();
             showToast('Anda telah Logout. Silakan login kembali dengan ID User & Password', 'fa-right-from-bracket', 'text-indigo-400');
         }
@@ -10765,7 +10807,10 @@
             }
 
             saveAuthData(true);
-            try { localStorage.setItem('yoplano_session_active_v1', '1'); } catch (e) {}
+            try {
+                sessionStorage.setItem('yoplano_tab_session_v1', '1');
+                localStorage.setItem('yoplano_session_active_v1', '1');
+            } catch (e) {}
             updateHeaderAndSidebarAuthUI();
             closeLoginOverlay();
 
@@ -11861,7 +11906,7 @@
         }
 
         function ensureActiveSessionRecorded() {
-            if (!localStorage.getItem('yoplano_session_active_v1') || !currentUser) return;
+            if (!sessionStorage.getItem('yoplano_tab_session_v1') || !currentUser) return;
             const nowStr = formatCurrentLoginTime();
             const dev = detectUserDeviceLabel();
             let changed = false;
@@ -11923,9 +11968,34 @@
                 syncAutoSkuFromPlanogram(false);
             }
             navigateTo('dashboard');
-            if (!localStorage.getItem('yoplano_session_active_v1')) {
+            if (!sessionStorage.getItem('yoplano_tab_session_v1')) {
+                try { localStorage.removeItem('yoplano_session_active_v1'); } catch (e) {}
                 openLoginOverlay();
             }
+
+            // Jangan auto-logout saat sedang membuka dialog Print
+            window.addEventListener('beforeprint', () => { isYoPlanoPrinting = true; });
+            window.addEventListener('afterprint', () => { setTimeout(() => { isYoPlanoPrinting = false; }, 500); });
+
+            // Otomatis logout jika berpindah tab, meminimalkan browser, atau pindah aplikasi di HP
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden' && !isYoPlanoPrinting) {
+                    performAutoLogout('Anda otomatis logout karena meninggalkan halaman atau membuka tab lain. Silakan login kembali.', true);
+                }
+            });
+
+            // Otomatis logout & set status OFFLINE jika menutup tab, menutup aplikasi/browser, atau mematikan PC/HP
+            window.addEventListener('pagehide', () => {
+                if (!isYoPlanoPrinting) {
+                    performAutoLogout('', true);
+                }
+            });
+            window.addEventListener('beforeunload', () => {
+                if (!isYoPlanoPrinting) {
+                    performAutoLogout('', true);
+                }
+            });
+
             // Auto-refresh Cloud setiap 10 detik untuk memantau siapa saja yang sedang login
             setInterval(() => {
                 if (yoplanoCloudDbUrl) {
