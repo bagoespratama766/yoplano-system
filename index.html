@@ -601,6 +601,9 @@
                     <i class="fa-solid fa-right-to-bracket"></i>
                     <span>Masuk ke Aplikasi</span>
                 </button>
+
+                <div id="loginCloudStatusHint" class="text-center text-[10px] font-bold text-slate-400 pt-1">
+                </div>
             </form>
         </div>
     </div>
@@ -10551,6 +10554,8 @@
                     if (activeView === 'master-user') {
                         renderMasterUserTableBody();
                         renderMasterUserLoginLogsBody();
+                    } else if (activeView === 'dashboard') {
+                        renderDashboard(document.getElementById('mainContent'));
                     }
                     if (!silent) showToast('Data terbaru berhasil ditarik dari Cloud Database!', 'fa-cloud-arrow-down', 'text-indigo-400');
                     return true;
@@ -10623,6 +10628,12 @@
             }
             const overlay = document.getElementById('loginOverlay');
             const errBox = document.getElementById('loginErrorBox');
+            const cloudHint = document.getElementById('loginCloudStatusHint');
+            if (cloudHint) {
+                cloudHint.innerHTML = yoplanoCloudDbUrl
+                    ? `<span class="text-emerald-600"><i class="fa-solid fa-cloud-bolt mr-1"></i>Terhubung Cloud Realtime Database</span>`
+                    : `<span class="text-amber-600"><i class="fa-solid fa-laptop mr-1"></i>Mode Lokal (Belum terhubung Cloud Firebase)</span>`;
+            }
             if (errBox) errBox.classList.add('hidden');
             if (overlay) {
                 overlay.classList.remove('hidden');
@@ -10714,7 +10725,12 @@
             return `${dd} ${mm} ${yyyy} ${hh}:${min}`;
         }
 
-        function loginWithUserObject(userObj) {
+        async function loginWithUserObject(userObj) {
+            if (yoplanoCloudDbUrl) {
+                await pullAuthDataFromCloud(true);
+                const latest = yoplanoUsers.find(u => u.id === userObj.id || String(u.username) === String(userObj.username));
+                if (latest) userObj = latest;
+            }
             const loginTimeStr = formatCurrentLoginTime();
             const deviceLabel = detectUserDeviceLabel();
             currentUser = {
@@ -11029,14 +11045,34 @@
             if (!file) return;
             const reader = new FileReader();
             reader.onload = function(ev) {
-                const dataUrl = ev.target.result;
-                const hiddenInput = document.getElementById('editProfileAvatarData');
-                if (hiddenInput) hiddenInput.value = dataUrl;
-                const preview = document.getElementById('profileCardAvatarPreview');
-                if (preview) {
-                    preview.innerHTML = `<img src="${dataUrl}" alt="Avatar" class="w-full h-full object-cover">`;
-                }
-                showToast('Foto profil siap disimpan, klik Simpan Perubahan Profil', 'fa-image', 'text-indigo-400');
+                const img = new Image();
+                img.onload = function() {
+                    const maxDim = 180;
+                    let w = img.width;
+                    let h = img.height;
+                    if (w > h && w > maxDim) {
+                        h = Math.round(h * (maxDim / w));
+                        w = maxDim;
+                    } else if (h >= w && h > maxDim) {
+                        w = Math.round(w * (maxDim / h));
+                        h = maxDim;
+                    }
+                    const canvas = document.createElement('canvas');
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, w, h);
+                    const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+
+                    const hiddenInput = document.getElementById('editProfileAvatarData');
+                    if (hiddenInput) hiddenInput.value = compressedDataUrl;
+                    const preview = document.getElementById('profileCardAvatarPreview');
+                    if (preview) {
+                        preview.innerHTML = `<img src="${compressedDataUrl}" alt="Avatar" class="w-full h-full object-cover">`;
+                    }
+                    showToast('Foto profil siap disimpan, klik Simpan Perubahan Profil', 'fa-image', 'text-indigo-400');
+                };
+                img.src = ev.target.result;
             };
             reader.readAsDataURL(file);
         }
@@ -11052,9 +11088,12 @@
             showToast('Avatar direset ke inisial nama', 'fa-rotate-left', 'text-amber-400');
         }
 
-        function saveMyProfile(e) {
+        async function saveMyProfile(e) {
             if (e) e.preventDefault();
             if (!currentUser) loadAuthData();
+            if (yoplanoCloudDbUrl) {
+                await pullAuthDataFromCloud(true);
+            }
 
             const fullName = (document.getElementById('editProfileFullName')?.value || '').trim();
             const nik = (document.getElementById('editProfileNik')?.value || '').trim();
@@ -11577,7 +11616,17 @@
 
         function downloadCloudEmbeddedIndexHtml() {
             if (!yoplanoCloudDbUrl) return alert('Masukkan dan simpan URL Firebase Realtime Database terlebih dahulu!');
-            let fullHtml = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+            const cloneDoc = document.documentElement.cloneNode(true);
+            const mainEl = cloneDoc.querySelector('#mainContent');
+            if (mainEl) mainEl.innerHTML = '';
+            const printEl = cloneDoc.querySelector('#printContainer');
+            if (printEl) printEl.innerHTML = '';
+            const modalEl = cloneDoc.querySelector('#modalOverlay');
+            if (modalEl) modalEl.classList.add('hidden');
+            const loginEl = cloneDoc.querySelector('#loginOverlay');
+            if (loginEl) loginEl.classList.add('hidden');
+
+            let fullHtml = '<!DOCTYPE html>\n' + cloneDoc.outerHTML;
             fullHtml = fullHtml.replace(
                 /const EMBEDDED_CLOUD_DB_URL = "[^"]*";/,
                 `const EMBEDDED_CLOUD_DB_URL = "${yoplanoCloudDbUrl}";`
