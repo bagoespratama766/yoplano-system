@@ -11977,10 +11977,32 @@
             window.addEventListener('beforeprint', () => { isYoPlanoPrinting = true; });
             window.addEventListener('afterprint', () => { setTimeout(() => { isYoPlanoPrinting = false; }, 500); });
 
-            // Otomatis logout jika berpindah tab, meminimalkan browser, atau pindah aplikasi di HP
+            // Timer 5 menit saat berpindah tab / meminimalkan browser / pindah aplikasi di HP
+            let tabAwayLogoutTimer = null;
+            let tabHiddenSinceTs = 0;
+            const TAB_AWAY_TIMEOUT_MS = 5 * 60 * 1000; // 5 menit
+
             document.addEventListener('visibilitychange', () => {
-                if (document.visibilityState === 'hidden' && !isYoPlanoPrinting) {
-                    performAutoLogout('Anda otomatis logout karena meninggalkan halaman atau membuka tab lain. Silakan login kembali.', true);
+                if (document.visibilityState === 'hidden') {
+                    if (isYoPlanoPrinting || !sessionStorage.getItem('yoplano_tab_session_v1')) return;
+                    if (!tabHiddenSinceTs) tabHiddenSinceTs = Date.now();
+                    if (tabAwayLogoutTimer) clearTimeout(tabAwayLogoutTimer);
+                    tabAwayLogoutTimer = setTimeout(() => {
+                        if (document.visibilityState === 'hidden' && !isYoPlanoPrinting) {
+                            performAutoLogout('Anda otomatis logout karena meninggalkan halaman lebih dari 5 menit. Silakan login kembali.', true);
+                        }
+                    }, TAB_AWAY_TIMEOUT_MS);
+                } else if (document.visibilityState === 'visible') {
+                    if (tabAwayLogoutTimer) {
+                        clearTimeout(tabAwayLogoutTimer);
+                        tabAwayLogoutTimer = null;
+                    }
+                    if (tabHiddenSinceTs && (Date.now() - tabHiddenSinceTs >= TAB_AWAY_TIMEOUT_MS) && !isYoPlanoPrinting) {
+                        tabHiddenSinceTs = 0;
+                        performAutoLogout('Anda otomatis logout karena meninggalkan halaman lebih dari 5 menit. Silakan login kembali.', true);
+                    } else {
+                        tabHiddenSinceTs = 0;
+                    }
                 }
             });
 
