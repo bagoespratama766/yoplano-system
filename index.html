@@ -10333,11 +10333,100 @@
             modalOverlay.classList.remove('hidden');
         }
 
+        // Hash SHA-256 bawaan browser (dengan fallback pure-JS agar berjalan di semua protokol)
+        function sha256FallbackHex(ascii) {
+            function rightRotate(value, amount) { return (value >>> amount) | (value << (32 - amount)); }
+            const mathPow = Math.pow, maxWord = mathPow(2, 32), lengthProperty = 'length';
+            let i, j, result = '';
+            const words = [], asciiBitLength = ascii[lengthProperty] * 8;
+            let hash = sha256FallbackHex.h = sha256FallbackHex.h || [];
+            const k = sha256FallbackHex.k = sha256FallbackHex.k || [];
+            let primeCounter = k[lengthProperty], isComposite = {};
+            for (let candidate = 2; primeCounter < 64; candidate++) {
+                if (!isComposite[candidate]) {
+                    for (i = 0; i < 313; i += candidate) isComposite[i] = candidate;
+                    hash[primeCounter] = (mathPow(candidate, .5) * maxWord) | 0;
+                    k[primeCounter++] = (mathPow(candidate, 1 / 3) * maxWord) | 0;
+                }
+            }
+            ascii += '\x80';
+            while (ascii[lengthProperty] % 64 - 56) ascii += '\x00';
+            for (i = 0; i < ascii[lengthProperty]; i++) {
+                j = ascii.charCodeAt(i);
+                words[i >> 2] |= j << ((3 - i) % 4) * 8;
+            }
+            words[words[lengthProperty]] = ((asciiBitLength / maxWord) | 0);
+            words[words[lengthProperty]] = (asciiBitLength);
+            for (j = 0; j < words[lengthProperty];) {
+                const w = words.slice(j, j += 16), oldHash = hash;
+                hash = hash.slice(0, 8);
+                for (i = 0; i < 64; i++) {
+                    const w15 = w[i - 15], w2 = w[i - 2];
+                    const a = hash[0], e = hash[4];
+                    const temp1 = hash[7] + (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25)) + ((e & hash[5]) ^ ((~e) & hash[6])) + k[i] + (w[i] = (i < 16) ? w[i] : (w[i - 16] + (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3)) + w[i - 7] + (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))) | 0);
+                    const temp2 = (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22)) + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+                    hash = [(temp1 + temp2) | 0].concat(hash);
+                    hash[4] = (hash[4] + temp1) | 0;
+                }
+                for (i = 0; i < 8; i++) hash[i] = (hash[i] + oldHash[i]) | 0;
+            }
+            for (i = 0; i < 8; i++) {
+                for (j = 3; j + 1; j--) {
+                    const b = (hash[i] >> (j * 8)) & 255;
+                    result += ((b < 16) ? 0 : '') + b.toString(16);
+                }
+            }
+            return result;
+        }
+
+        async function hashPasswordSha256(plainText) {
+            const str = String(plainText ?? '');
+            if (str.startsWith('sha256:') && str.length === 71) return str;
+            try {
+                if (window.crypto && window.crypto.subtle) {
+                    const utf8 = new TextEncoder().encode(str);
+                    const hashBuffer = await window.crypto.subtle.digest('SHA-256', utf8);
+                    const hashArray = Array.from(new Uint8Array(hashBuffer));
+                    return 'sha256:' + hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                }
+            } catch (e) {}
+            const utf8Bytes = unescape(encodeURIComponent(str));
+            return 'sha256:' + sha256FallbackHex(utf8Bytes);
+        }
+
+        async function migrateUsersToSha256IfNeeded(pushToCloud = false) {
+            let migrated = false;
+            for (const u of yoplanoUsers) {
+                if (!u) continue;
+                if (u.password && !u.passwordHash) {
+                    u.passwordHash = await hashPasswordSha256(u.password);
+                    delete u.password;
+                    migrated = true;
+                } else if (u.password && u.passwordHash) {
+                    delete u.password;
+                    migrated = true;
+                }
+            }
+            if (currentUser) {
+                if (currentUser.password && !currentUser.passwordHash) {
+                    currentUser.passwordHash = await hashPasswordSha256(currentUser.password);
+                    delete currentUser.password;
+                    migrated = true;
+                } else if (currentUser.password) {
+                    delete currentUser.password;
+                    migrated = true;
+                }
+            }
+            if (migrated) {
+                saveAuthData(pushToCloud);
+            }
+        }
+
         const DEFAULT_YOPLANO_USERS = [
             {
                 id: 'usr_admin_1',
                 username: '224125043',
-                password: '123456',
+                passwordHash: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92',
                 fullName: 'FAUZIAN',
                 nik: '224125043',
                 role: 'ADMIN_MASTER',
@@ -10351,7 +10440,7 @@
             {
                 id: 'usr_staff_1',
                 username: '20500412',
-                password: '123456',
+                passwordHash: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92',
                 fullName: 'STAFF OPERASIONAL',
                 nik: '20500412',
                 role: 'USER',
@@ -11006,12 +11095,18 @@
             if (yoplanoCloudDbUrl) {
                 await pullAuthDataFromCloud(true);
             }
+            await migrateUsersToSha256IfNeeded(false);
+
             const inputId = (document.getElementById('loginUsernameInput')?.value || '').trim().toLowerCase();
             const password = (document.getElementById('loginPasswordInput')?.value || '').trim();
+            const inputHash = await hashPasswordSha256(password);
 
             const found = yoplanoUsers.find(u =>
                 (String(u.username || '').toLowerCase() === inputId || String(u.nik || '').toLowerCase() === inputId) &&
-                String(u.password || '') === password
+                (
+                    (u.passwordHash && u.passwordHash === inputHash) ||
+                    (u.password && String(u.password) === password)
+                )
             );
 
             if (!found) {
@@ -11296,9 +11391,9 @@
                                         <input type="text" id="editProfileUsername" required value="${escapeHtml(currentUser.username || '')}" placeholder="Contoh: 224125043" class="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
                                     </div>
                                     <div>
-                                        <label class="block text-xs font-extrabold text-slate-700 uppercase mb-1.5">Password Login *</label>
+                                        <label class="block text-xs font-extrabold text-slate-700 uppercase mb-1.5">Password Baru (Opsional)</label>
                                         <div class="relative">
-                                            <input type="password" id="editProfilePassword" required value="${escapeHtml(currentUser.password || '')}" placeholder="Contoh: 123456" class="w-full pl-3.5 pr-10 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
+                                            <input type="password" id="editProfilePassword" value="" placeholder="Kosongkan jika password tetap" class="w-full pl-3.5 pr-10 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
                                             <button type="button" onclick="const p=document.getElementById('editProfilePassword'); p.type = p.type==='password'?'text':'password';" class="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 text-xs">
                                                 <i class="fa-solid fa-eye"></i>
                                             </button>
@@ -11429,8 +11524,8 @@
             const phone = (document.getElementById('editProfilePhone')?.value || '').trim();
             const avatarUrl = document.getElementById('editProfileAvatarData')?.value || '';
 
-            if (!fullName || !username || !password) {
-                alert('Nama Lengkap, Username, dan Password wajib diisi!');
+            if (!fullName || !username) {
+                alert('Nama Lengkap dan ID User / Username wajib diisi!');
                 return;
             }
 
@@ -11441,12 +11536,16 @@
                 return;
             }
 
+            const newPasswordHash = password
+                ? await hashPasswordSha256(password)
+                : (currentUser.passwordHash || await hashPasswordSha256('123456'));
+
             currentUser = {
                 ...currentUser,
                 fullName,
                 nik,
                 username,
-                password,
+                passwordHash: newPasswordHash,
                 jabatan,
                 role,
                 storeCode,
@@ -11455,6 +11554,7 @@
                 phone,
                 avatarUrl
             };
+            delete currentUser.password;
 
             const idx = yoplanoUsers.findIndex(u => u.id === currentUser.id);
             if (idx !== -1) {
@@ -11607,10 +11707,10 @@
                                 </div>
 
                                 <div>
-                                    <label class="block text-[11px] font-extrabold text-slate-700 uppercase mb-1">Password Login *</label>
+                                    <label class="block text-[11px] font-extrabold text-slate-700 uppercase mb-1">${editingUser ? 'Password Baru (Opsional)' : 'Password Login *'}</label>
                                     <div class="relative">
                                         <i class="fa-solid fa-key absolute left-3 top-2.5 text-slate-400 text-xs"></i>
-                                        <input type="text" id="inlineMuPassword" required value="${escapeHtml(editingUser?.password || '')}" placeholder="Misal: 123456" class="w-full pl-8 pr-3 py-2 border border-slate-300 rounded-xl text-xs font-extrabold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
+                                        <input type="text" id="inlineMuPassword" ${editingUser ? '' : 'required'} value="" placeholder="${editingUser ? 'Kosongkan jika password tetap' : 'Masukkan password user'}" class="w-full pl-8 pr-3 py-2 border border-slate-300 rounded-xl text-xs font-extrabold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
                                     </div>
                                 </div>
 
@@ -11771,7 +11871,7 @@
                 const isCurrent = currentUser && currentUser.id === u.id;
                 const initials = getInitialsFromName(u.fullName);
                 const showPass = !!masterUserShowPassMap[u.id];
-                const maskedPass = '•'.repeat(Math.max(6, String(u.password || '').length));
+                const hashDisplay = u.passwordHash ? `${String(u.passwordHash).slice(0, 15)}...` : 'sha256:tersimpan';
                 const isOnline = !!u.isOnline || isCurrent;
                 const displayLoginText = u.lastLoginText || (isCurrent ? (currentUser.lastLoginText || formatCurrentLoginTime()) : '');
                 const displayDevice = u.lastDevice || (isCurrent ? (currentUser.lastDevice || detectUserDeviceLabel()) : '');
@@ -11787,9 +11887,10 @@
                             </div>
                         </td>
                         <td class="p-3.5">
-                            <div class="inline-flex items-center gap-2 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg">
-                                <span class="font-mono font-extrabold text-xs ${showPass ? 'text-emerald-700' : 'text-slate-500'}">${showPass ? escapeHtml(u.password) : maskedPass}</span>
-                                <button type="button" onclick="toggleMasterUserPass('${u.id}')" title="Lihat / Sembunyikan Password" class="text-slate-400 hover:text-indigo-600 text-xs">
+                            <div class="inline-flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg" title="Password dienkripsi satu arah dengan SHA-256">
+                                <i class="fa-solid fa-shield-halved text-emerald-600 text-[10px]"></i>
+                                <span class="font-mono font-bold text-[10px] text-emerald-700">${showPass ? escapeHtml(hashDisplay) : 'Terenkripsi SHA-256'}</span>
+                                <button type="button" onclick="toggleMasterUserPass('${u.id}')" title="Lihat / Sembunyikan Hash" class="text-emerald-600 hover:text-indigo-600 text-xs">
                                     <i class="fa-solid ${showPass ? 'fa-eye-slash' : 'fa-eye'}"></i>
                                 </button>
                             </div>
@@ -12003,7 +12104,7 @@
             renderMasterUser(document.getElementById('mainContent'));
         }
 
-        function saveInlineMasterUserForm(e) {
+        async function saveInlineMasterUserForm(e) {
             if (e) e.preventDefault();
             const editId = (document.getElementById('inlineMuEditId')?.value || '').trim();
             const username = (document.getElementById('inlineMuUsername')?.value || '').trim();
@@ -12012,8 +12113,8 @@
             const role = document.getElementById('inlineMuRole')?.value || 'USER';
             const jabatan = (document.getElementById('inlineMuJabatan')?.value || 'Staff Operasional').trim();
 
-            if (!username || !password || !fullName) {
-                alert('ID User Login, Password, dan Nama Lengkap wajib diisi!');
+            if (!username || !fullName || (!editId && !password)) {
+                alert('ID User Login, Nama Lengkap, dan Password (untuk user baru) wajib diisi!');
                 return;
             }
 
@@ -12026,15 +12127,20 @@
             if (editId) {
                 const idx = yoplanoUsers.findIndex(u => u.id === editId);
                 if (idx !== -1) {
-                    yoplanoUsers[idx] = {
+                    const nextHash = password
+                        ? await hashPasswordSha256(password)
+                        : (yoplanoUsers[idx].passwordHash || await hashPasswordSha256(yoplanoUsers[idx].password || '123456'));
+                    const updated = {
                         ...yoplanoUsers[idx],
                         username,
                         nik: username,
-                        password,
+                        passwordHash: nextHash,
                         fullName,
                         role,
                         jabatan
                     };
+                    delete updated.password;
+                    yoplanoUsers[idx] = updated;
                     if (currentUser && currentUser.id === editId) {
                         currentUser = { ...yoplanoUsers[idx] };
                     }
@@ -12042,11 +12148,12 @@
                 masterUserEditingId = '';
                 showToast(`Data user ${fullName} (ID: ${username}) berhasil diperbarui!`, 'fa-circle-check', 'text-emerald-400');
             } else {
+                const passwordHash = await hashPasswordSha256(password);
                 yoplanoUsers.push({
                     id: 'usr_' + Date.now(),
                     username,
                     nik: username,
-                    password,
+                    passwordHash,
                     fullName,
                     role,
                     jabatan,
@@ -12058,7 +12165,7 @@
                     isOnline: false,
                     lastLoginText: ''
                 });
-                showToast(`User baru ${fullName} (ID: ${username}) berhasil ditambahkan!`, 'fa-user-plus', 'text-emerald-400');
+                showToast(`User baru ${fullName} (ID: ${username}) berhasil ditambahkan (Terenkripsi SHA-256)!`, 'fa-user-plus', 'text-emerald-400');
             }
 
             saveAuthData(true);
@@ -12078,8 +12185,8 @@
                             <input type="text" id="muUsername" required value="${escapeHtml(existing?.username || '')}" placeholder="Contoh: 224125043" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold font-mono">
                         </div>
                         <div>
-                            <label class="block text-xs font-extrabold text-slate-700 uppercase mb-1">Password Login *</label>
-                            <input type="text" id="muPassword" required value="${escapeHtml(existing?.password || '')}" placeholder="Contoh: 123456" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold font-mono">
+                            <label class="block text-xs font-extrabold text-slate-700 uppercase mb-1">${existing ? 'Password Baru (Opsional)' : 'Password Login *'}</label>
+                            <input type="text" id="muPassword" ${existing ? '' : 'required'} value="" placeholder="${existing ? 'Kosongkan jika password tetap' : 'Masukkan password user'}" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold font-mono">
                         </div>
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -12113,7 +12220,7 @@
             `);
         }
 
-        function saveMasterUserModal(e, editId) {
+        async function saveMasterUserModal(e, editId) {
             if (e) e.preventDefault();
             const fullName = (document.getElementById('muFullName')?.value || '').trim().toUpperCase();
             const username = (document.getElementById('muUsername')?.value || '').trim();
@@ -12122,7 +12229,7 @@
             const jabatan = (document.getElementById('muJabatan')?.value || '').trim();
             const storeCode = (document.getElementById('muStoreCode')?.value || '205 - YPC YOGYA PLAZA CIMAHI').trim();
 
-            if (!fullName || !username || !password) return;
+            if (!fullName || !username || (!editId && !password)) return;
 
             const duplicate = yoplanoUsers.find(u => u.id !== editId && String(u.username).toLowerCase() === username.toLowerCase());
             if (duplicate) {
@@ -12133,18 +12240,24 @@
             if (editId) {
                 const idx = yoplanoUsers.findIndex(u => u.id === editId);
                 if (idx !== -1) {
-                    yoplanoUsers[idx] = { ...yoplanoUsers[idx], fullName, nik: username, username, password, role, jabatan, storeCode };
+                    const nextHash = password
+                        ? await hashPasswordSha256(password)
+                        : (yoplanoUsers[idx].passwordHash || await hashPasswordSha256(yoplanoUsers[idx].password || '123456'));
+                    const updated = { ...yoplanoUsers[idx], fullName, nik: username, username, passwordHash: nextHash, role, jabatan, storeCode };
+                    delete updated.password;
+                    yoplanoUsers[idx] = updated;
                     if (currentUser && currentUser.id === editId) {
                         currentUser = { ...yoplanoUsers[idx] };
                     }
                 }
             } else {
+                const passwordHash = await hashPasswordSha256(password);
                 yoplanoUsers.push({
                     id: 'usr_' + Date.now(),
                     fullName,
                     nik: username,
                     username,
-                    password,
+                    passwordHash,
                     role,
                     jabatan,
                     storeCode,
@@ -12239,6 +12352,7 @@
             if (yoplanoCloudDbUrl) {
                 await pullAuthDataFromCloud(true);
             }
+            await migrateUsersToSha256IfNeeded(Boolean(yoplanoCloudDbUrl));
             if (typeof pullCatalogFromMasterStock === 'function') {
                 await pullCatalogFromMasterStock(true);
             }
