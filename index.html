@@ -1455,9 +1455,6 @@
                 Object.entries(snapshot).forEach(([key, value]) => localStorage.setItem(key, JSON.stringify(value)));
                 localStorage.setItem('yoplano_last_saved_at', new Date().toISOString());
                 updateStorageStatus();
-                if (pushMasterStock && typeof pushCatalogToMasterStock === 'function') {
-                    pushCatalogToMasterStock(true);
-                }
             } catch (error) {
                 console.error('YoPlano save failed:', error);
                 showToast('Penyimpanan browser gagal. Segera unduh backup data!', 'fa-triangle-exclamation', 'text-rose-400');
@@ -1610,6 +1607,7 @@
         // ROUTER SYSTEM
         function navigateTo(viewName) {
             activeView = viewName;
+            try { sessionStorage.setItem('yoplano_active_view_v1', viewName); } catch (e) {}
             
             document.querySelectorAll('.nav-btn').forEach(btn => {
                 btn.classList.remove('bg-indigo-600', 'text-white', 'font-bold');
@@ -3365,23 +3363,24 @@
                         <h1 class="text-xl font-bold text-slate-800">Manajemen PLU 8 Digit, Divisi, & Kategori</h1>
                     </div>
                     <div class="flex flex-wrap items-center gap-2">
-                        <button onclick="syncMasterStockTwoWay(false)" class="bg-cyan-600 hover:bg-cyan-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow transition" title="Sinkronkan 2 Arah Harga & Barang dengan Master Stock">
-                            <i class="fa-solid fa-arrows-rotate"></i>
-                            <span>Sync Master Stock</span>
+                        <button onclick="pullCatalogFromMasterStock(false)" class="bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-lg text-xs font-semibold flex items-center space-x-2 shadow transition" title="Tarik Data PLU Terbaru dari Master Stok">
+                            <i class="fa-solid fa-cloud-arrow-down"></i>
+                            <span>Tarik Data Master Stok</span>
                         </button>
                         <button onclick="triggerCsvImport()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow transition">
                             <i class="fa-solid fa-file-csv"></i>
-                            <span>Import CSV PLU</span>
+                            <span>Update Harga CSV</span>
                         </button>
                         <button onclick="downloadPluTemplateCsv()" class="bg-slate-700 hover:bg-slate-800 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow transition">
                             <i class="fa-solid fa-download"></i>
                             <span>Template CSV Rapi</span>
                         </button>
-                        <button onclick="openPluFormModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg text-xs font-semibold flex items-center space-x-2 shadow transition">
-                            <i class="fa-solid fa-plus"></i>
-                            <span>+ Input PLU Baru</span>
-                        </button>
                     </div>
+                </div>
+
+                <div class="mb-4 bg-cyan-50 border border-cyan-200 text-cyan-800 px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2">
+                    <i class="fa-solid fa-circle-info text-cyan-600"></i>
+                    <span><b>Sumber Data PLU: Master Stok (Realtime)</b> — Input PLU barang baru dilakukan di aplikasi <b>Master Stok</b> saat barang datang. Data di YoPlano otomatis tersinkronisasi untuk cetak POP &amp; SKU.</span>
                 </div>
 
                 <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
@@ -3500,6 +3499,10 @@
         }
 
         function openPluFormModal(editId = null) {
+            if (!editId) {
+                showToast('Input PLU baru dilakukan dari aplikasi Master Stok!', 'fa-circle-info', 'text-cyan-400');
+                return;
+            }
             let item = { id: '', plu8: '', packageBarcode: '', name: '', divisi: 'FOOD', category: 'BAKERY', price: '', promoPrice: '', promoStartDate: '', promoEndDate: '', promoPeriod: '', imageUrl: '' };
             let isEdit = false;
             if (editId) {
@@ -10613,64 +10616,69 @@
 
         async function pushCatalogToMasterStock(silent = true) {
             lastMasterStockWriteTs = Date.now();
-            let pushedFirestore = false;
+            let fsResult = null;
+            let fsErrorMsg = '';
 
             // Dorong ke Cloud Firestore Master Stok (master-stok-app -> master_products) agar sinkron dengan Master Stok & YoPule
             if (window.yoplanoMasterStokFirestoreBridge && typeof window.yoplanoMasterStokFirestoreBridge.pushCatalog === 'function') {
                 try {
-                    pushedFirestore = await window.yoplanoMasterStokFirestoreBridge.pushCatalog(skuCatalog);
+                    fsResult = await window.yoplanoMasterStokFirestoreBridge.pushCatalog(skuCatalog);
                 } catch (fsErr) {
+                    fsErrorMsg = fsErr?.message || String(fsErr);
                     console.warn('Firestore Master Stok push error:', fsErr);
                 }
             }
 
             const url = getMasterStockDbUrl();
-            if (!url) return pushedFirestore;
-            try {
-                const payloadItems = skuCatalog.map(item => ({
-                    id: item.id,
-                    plu8: item.plu8,
-                    plu: item.plu8,
-                    packageBarcode: item.packageBarcode || item.plu8,
-                    barcode: item.packageBarcode || item.plu8,
-                    name: item.name,
-                    nama: item.name,
-                    divisi: item.divisi,
-                    category: item.category,
-                    kategori: item.category,
-                    normalPrice: Number(item.normalPrice) || 0,
-                    harga: Number(item.normalPrice) || 0,
-                    promoPrice: Number(item.promoPrice) || 0,
-                    harga_promo: Number(item.promoPrice) || 0,
-                    promoStartDate: item.promoStartDate || '',
-                    promoEndDate: item.promoEndDate || '',
-                    promoPeriod: item.promoPeriod || '',
-                    imageUrl: item.imageUrl || '',
-                    updatedAt: new Date().toISOString()
-                }));
+            if (url) {
+                try {
+                    const payloadItems = skuCatalog.map(item => ({
+                        id: item.id,
+                        plu8: item.plu8,
+                        plu: item.plu8,
+                        packageBarcode: item.packageBarcode || item.plu8,
+                        barcode: item.packageBarcode || item.plu8,
+                        name: item.name,
+                        nama: item.name,
+                        divisi: item.divisi,
+                        category: item.category,
+                        kategori: item.category,
+                        normalPrice: Number(item.normalPrice) || 0,
+                        harga: Number(item.normalPrice) || 0,
+                        promoPrice: Number(item.promoPrice) || 0,
+                        harga_promo: Number(item.promoPrice) || 0,
+                        promoStartDate: item.promoStartDate || '',
+                        promoEndDate: item.promoEndDate || '',
+                        promoPeriod: item.promoPeriod || '',
+                        imageUrl: item.imageUrl || '',
+                        updatedAt: new Date().toISOString()
+                    }));
 
-                const res = await fetch(`${url}/yoplano_master_stock.json`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        items: payloadItems,
-                        source: 'YoPlano_Ungu',
-                        updatedAt: formatCurrentLoginTime(),
-                        updatedTs: Date.now()
-                    })
-                });
-                if (!res.ok) throw new Error('HTTP ' + res.status);
+                    await fetch(`${url}/yoplano_master_stock.json`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            items: payloadItems,
+                            source: 'YoPlano_Ungu',
+                            updatedAt: formatCurrentLoginTime(),
+                            updatedTs: Date.now()
+                        })
+                    });
+                } catch (err) {}
+            }
+
+            if (fsResult && fsResult.ok) {
                 if (!silent) {
-                    showToast('Data harga & barang berhasil dikirim ke Master Stock!', 'fa-cloud-arrow-up', 'text-emerald-400');
+                    if (fsResult.failedCount > 0 && fsResult.pushedCount === 0) {
+                        showToast(`Gagal menulis ke Master Stok Firestore (${fsResult.failedCount} item ditolak Rules).`, 'fa-triangle-exclamation', 'text-rose-400');
+                    } else {
+                        showToast(`Sinkronisasi selesai! ${fsResult.pushedCount} barang baru/perubahan dikirim ke Master Stok.`, 'fa-cloud-arrow-up', 'text-emerald-400');
+                    }
                 }
                 return true;
-            } catch (err) {
-                if (pushedFirestore) {
-                    if (!silent) showToast('Data harga & barang berhasil disinkronkan ke Master Stok Firestore!', 'fa-cloud-arrow-up', 'text-emerald-400');
-                    return true;
-                }
+            } else {
                 if (!silent) {
-                    showToast('Gagal mengirim data ke Master Stock.', 'fa-triangle-exclamation', 'text-amber-400');
+                    showToast(fsErrorMsg ? `Error Master Stok: ${fsErrorMsg}` : 'Jembatan Firestore Master Stok belum siap, coba beberapa detik lagi.', 'fa-triangle-exclamation', 'text-amber-400');
                 }
                 return false;
             }
@@ -12239,8 +12247,10 @@
             if (typeof syncAutoSkuFromPlanogram === 'function') {
                 syncAutoSkuFromPlanogram(false);
             }
-            navigateTo('dashboard');
-            if (!sessionStorage.getItem('yoplano_tab_session_v1')) {
+            const isTabLoggedIn = sessionStorage.getItem('yoplano_tab_session_v1') === '1';
+            const initialView = isTabLoggedIn ? (sessionStorage.getItem('yoplano_active_view_v1') || 'dashboard') : 'dashboard';
+            navigateTo(initialView);
+            if (!isTabLoggedIn) {
                 try { localStorage.removeItem('yoplano_session_active_v1'); } catch (e) {}
                 openLoginOverlay();
             }
@@ -12250,6 +12260,7 @@
             window.addEventListener('afterprint', () => { setTimeout(() => { isYoPlanoPrinting = false; }, 500); });
 
             // Timer 5 menit saat berpindah tab / meminimalkan browser / pindah aplikasi di HP
+            // (Refresh F5 / Ctrl+Shift+R tidak me-logout; menutup tab/aplikasi otomatis menghapus sessionStorage sehingga wajib login ulang saat dibuka lagi)
             let tabAwayLogoutTimer = null;
             let tabHiddenSinceTs = 0;
             const TAB_AWAY_TIMEOUT_MS = 5 * 60 * 1000; // 5 menit
@@ -12275,18 +12286,6 @@
                     } else {
                         tabHiddenSinceTs = 0;
                     }
-                }
-            });
-
-            // Otomatis logout & set status OFFLINE jika menutup tab, menutup aplikasi/browser, atau mematikan PC/HP
-            window.addEventListener('pagehide', () => {
-                if (!isYoPlanoPrinting) {
-                    performAutoLogout('', true);
-                }
-            });
-            window.addEventListener('beforeunload', () => {
-                if (!isYoPlanoPrinting) {
-                    performAutoLogout('', true);
                 }
             });
 
@@ -12366,29 +12365,47 @@
                     if (key) existingByPlu.set(key, { docId: d.id, data: dt });
                 });
 
+                // Pastikan divisi & kategori juga tersedia di master_divisions / master_categories
+                const divSnap = await getDocs(collection(msDb, 'master_divisions'));
+                const existingDivs = new Set(divSnap.docs.map(d => String(d.data()?.name || '').trim().toUpperCase()));
+                const catSnap = await getDocs(collection(msDb, 'master_categories'));
+                const existingCats = new Set(catSnap.docs.map(d => `${String(d.data()?.division || '').trim().toUpperCase()}||${String(d.data()?.name || '').trim().toUpperCase()}`));
+
+                let pushedCount = 0;
+                let failedCount = 0;
+
                 for (const item of (catalogList || [])) {
                     if (!item || !item.plu8) continue;
-                    const match = existingByPlu.get(String(item.plu8).trim());
-                    const targetDocId = item.firestoreId || (match ? match.docId : ('yp_' + item.plu8));
+                    const pluKey = String(item.plu8).trim();
+                    const match = existingByPlu.get(pluKey);
+                    const targetDocId = item.firestoreId || (match ? match.docId : ('yp_' + pluKey));
                     const prev = match ? match.data : {};
+
+                    let safeImg = item.imageUrl || prev.customImage || '';
+                    if (safeImg && safeImg.length > 250000) {
+                        safeImg = prev.customImage && prev.customImage.length <= 250000 ? prev.customImage : '';
+                    }
+
+                    const divName = String(item.divisi || prev.division || 'FOOD').trim().toUpperCase() || 'FOOD';
+                    const catName = String(item.category || prev.category || 'GENERAL').trim().toUpperCase() || 'GENERAL';
 
                     const payload = {
                         id: targetDocId,
-                        plu: String(item.plu8),
-                        pluKemasan: String(item.packageBarcode || prev.pluKemasan || item.plu8),
+                        plu: pluKey,
+                        pluKemasan: String(item.packageBarcode || prev.pluKemasan || pluKey),
                         name: String(item.name || prev.name || ''),
                         price: Number(item.normalPrice) || 0,
                         promoPrice: (Number(item.promoPrice) > 0) ? Number(item.promoPrice) : null,
-                        division: String(item.divisi || prev.division || 'FOOD'),
-                        category: String(item.category || prev.category || 'GENERAL'),
+                        division: divName,
+                        category: catName,
                         unit: prev.unit || 'PCS',
                         stock: typeof prev.stock === 'number' ? prev.stock : (typeof item.stockQty === 'number' ? item.stockQty : 0),
-                        customImage: item.imageUrl || prev.customImage || '',
+                        customImage: safeImg || null,
                         updatedAt: nowIso,
+                        updatedBy: (window.currentUser && window.currentUser.fullName) ? window.currentUser.fullName : 'YoPlano Ungu',
                         sourceApp: 'YoPlano Ungu'
                     };
 
-                    // Hanya tulis jika ada perubahan data agar tidak memicu loop sync berlebihan
                     if (
                         !match ||
                         prev.name !== payload.name ||
@@ -12398,10 +12415,32 @@
                         prev.category !== payload.category ||
                         prev.pluKemasan !== payload.pluKemasan
                     ) {
-                        await setDoc(doc(msDb, 'master_products', targetDocId), payload, { merge: true });
+                        try {
+                            await setDoc(doc(msDb, 'master_products', targetDocId), payload, { merge: true });
+                            pushedCount++;
+                        } catch (docErr) {
+                            failedCount++;
+                            console.warn('Gagal push item ke Master Stok:', pluKey, docErr);
+                        }
+                    }
+
+                    if (!existingDivs.has(divName)) {
+                        existingDivs.add(divName);
+                        const divId = 'div_' + divName.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+                        try {
+                            await setDoc(doc(msDb, 'master_divisions', divId), { id: divId, name: divName, description: '', updatedAt: nowIso }, { merge: true });
+                        } catch (e) {}
+                    }
+                    const catKey = `${divName}||${catName}`;
+                    if (!existingCats.has(catKey)) {
+                        existingCats.add(catKey);
+                        const catId = 'cat_' + (divName + '_' + catName).toLowerCase().replace(/[^a-z0-9]+/g, '_');
+                        try {
+                            await setDoc(doc(msDb, 'master_categories', catId), { id: catId, name: catName, division: divName, description: '', updatedAt: nowIso }, { merge: true });
+                        } catch (e) {}
                     }
                 }
-                return true;
+                return { ok: true, pushedCount, failedCount, totalMaster: existingByPlu.size + pushedCount };
             }
         };
 
