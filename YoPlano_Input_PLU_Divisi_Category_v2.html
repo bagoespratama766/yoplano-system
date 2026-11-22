@@ -582,7 +582,7 @@
                     <label class="block text-xs font-extrabold text-slate-700 uppercase mb-1.5">ID User / NIK Login</label>
                     <div class="relative">
                         <i class="fa-solid fa-id-badge absolute left-3.5 top-3 text-slate-400 text-xs"></i>
-                        <input type="text" id="loginUsernameInput" required placeholder="Masukkan ID User (contoh: 224125043)" class="w-full pl-9 pr-3 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100">
+                        <input type="text" id="loginUsernameInput" required placeholder="Masukkan ID User" class="w-full pl-9 pr-3 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100">
                     </div>
                 </div>
 
@@ -590,7 +590,7 @@
                     <label class="block text-xs font-extrabold text-slate-700 uppercase mb-1.5">Password</label>
                     <div class="relative">
                         <i class="fa-solid fa-lock absolute left-3.5 top-3 text-slate-400 text-xs"></i>
-                        <input type="password" id="loginPasswordInput" required placeholder="Masukkan Password (contoh: 123456)" class="w-full pl-9 pr-10 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100">
+                        <input type="password" id="loginPasswordInput" required placeholder="Masukkan Password" class="w-full pl-9 pr-10 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100">
                         <button type="button" onclick="toggleLoginPasswordVisibility()" class="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 text-xs p-1">
                             <i id="loginPassEyeIcon" class="fa-solid fa-eye"></i>
                         </button>
@@ -601,6 +601,9 @@
                     <i class="fa-solid fa-right-to-bracket"></i>
                     <span>Masuk ke Aplikasi</span>
                 </button>
+
+                <div id="loginCloudStatusHint" class="text-center text-[10px] font-bold text-slate-400 pt-1">
+                </div>
             </form>
         </div>
     </div>
@@ -1433,7 +1436,7 @@
             applyDarkModeState(savedDark === 'true');
         }
 
-        function saveData() {
+        function saveData(pushMasterStock = true) {
             // Save atomically per key and report quota/private-mode failures clearly.
             try {
                 const snapshot = {
@@ -1452,6 +1455,9 @@
                 Object.entries(snapshot).forEach(([key, value]) => localStorage.setItem(key, JSON.stringify(value)));
                 localStorage.setItem('yoplano_last_saved_at', new Date().toISOString());
                 updateStorageStatus();
+                if (pushMasterStock && typeof pushCatalogToMasterStock === 'function') {
+                    pushCatalogToMasterStock(true);
+                }
             } catch (error) {
                 console.error('YoPlano save failed:', error);
                 showToast('Penyimpanan browser gagal. Segera unduh backup data!', 'fa-triangle-exclamation', 'text-rose-400');
@@ -3359,6 +3365,10 @@
                         <h1 class="text-xl font-bold text-slate-800">Manajemen PLU 8 Digit, Divisi, & Kategori</h1>
                     </div>
                     <div class="flex flex-wrap items-center gap-2">
+                        <button onclick="syncMasterStockTwoWay(false)" class="bg-cyan-600 hover:bg-cyan-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow transition" title="Sinkronkan 2 Arah Harga & Barang dengan Master Stock">
+                            <i class="fa-solid fa-arrows-rotate"></i>
+                            <span>Sync Master Stock</span>
+                        </button>
                         <button onclick="triggerCsvImport()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow transition">
                             <i class="fa-solid fa-file-csv"></i>
                             <span>Import CSV PLU</span>
@@ -10401,10 +10411,318 @@
             'profile': 'Profil Saya'
         };
 
+        // URL Cloud Database (Firebase Realtime Database) untuk sinkronisasi lintas perangkat
+        const EMBEDDED_CLOUD_DB_URL = "https://yoplano-system-default-rtdb.asia-southeast1.firebasedatabase.app";
+        const EMBEDDED_MASTER_STOCK_URL = "https://master-stok-app-default-rtdb.asia-southeast1.firebasedatabase.app";
+        let yoplanoCloudDbUrl = "";
+        let masterStockDbUrl = "";
+        let lastMasterStockWriteTs = 0;
         let yoplanoUsers = [];
+        let yoplanoLoginLogs = [];
         let currentUser = null;
+        let cloudSyncTimer = null;
+
+        function getMasterStockDbUrl() {
+            if (masterStockDbUrl) return masterStockDbUrl;
+            try {
+                masterStockDbUrl = normalizeCloudDbUrl(
+                    localStorage.getItem('yoplano_master_stock_db_url_v1') || EMBEDDED_MASTER_STOCK_URL || ''
+                );
+            } catch (e) {
+                masterStockDbUrl = normalizeCloudDbUrl(EMBEDDED_MASTER_STOCK_URL || '');
+            }
+            return masterStockDbUrl;
+        }
+
+        function isMasterStockItemObject(obj) {
+            if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+            return Boolean(
+                obj.plu8 || obj.plu || obj.kode_plu || obj.artCode || obj.kode ||
+                obj.name || obj.nama || obj.nama_barang || obj.namaBarang || obj.article || obj.description
+            );
+        }
+
+        function extractItemsArrayFromMasterStockPayload(rootData) {
+            if (!rootData || typeof rootData !== 'object') return [];
+            if (Array.isArray(rootData)) return rootData.filter(Boolean);
+
+            const priorityKeys = [
+                'yoplano_master_stock', 'master_stock', 'masterStock',
+                'sku_catalog', 'skuCatalog', 'catalog', 'items', 'products',
+                'barang', 'stok', 'stock', 'articles', 'data'
+            ];
+
+            for (const key of priorityKeys) {
+                const branch = rootData[key];
+                if (!branch) continue;
+                if (Array.isArray(branch)) return branch.filter(Boolean);
+                if (typeof branch === 'object') {
+                    if (Array.isArray(branch.items)) return branch.items.filter(Boolean);
+                    if (Array.isArray(branch.catalog)) return branch.catalog.filter(Boolean);
+                    const vals = Object.values(branch).filter(isMasterStockItemObject);
+                    if (vals.length > 0) return vals;
+                }
+            }
+
+            // Fallback: cek jika root langsung berisi map PLU/item
+            const rootVals = Object.values(rootData).filter(isMasterStockItemObject);
+            return rootVals;
+        }
+
+        function normalizeMasterStockRecordToYoPlano(raw, idx = 0) {
+            if (!raw || typeof raw !== 'object') return null;
+            const rawPlu = String(raw.plu8 || raw.plu || raw.kode_plu || raw.artCode || raw.kode || raw.id || '').trim();
+            const plu8 = /^\d{1,8}$/.test(rawPlu) ? rawPlu.padStart(8, '0') : (rawPlu || String(10000000 + idx));
+            const name = String(raw.name || raw.nama || raw.nama_barang || raw.namaBarang || raw.article || raw.description || '').trim().toUpperCase();
+            if (!name) return null;
+
+            const packageBarcode = String(raw.packageBarcode || raw.pluKemasan || raw.barcode || raw.barcode_kemasan || raw.ean || raw.tillCode || plu8).trim();
+            const divisi = String(raw.divisi || raw.division || 'FOOD').trim().toUpperCase() || 'FOOD';
+            const category = String(raw.category || raw.kategori || 'GENERAL').trim().toUpperCase() || 'GENERAL';
+            const normalPrice = Math.max(0, parseInt(raw.normalPrice ?? raw.harga_normal ?? raw.hargaNormal ?? raw.harga ?? raw.price ?? raw.salesPrice ?? 0) || 0);
+            const promoPrice = Math.max(0, parseInt(raw.promoPrice ?? raw.harga_promo ?? raw.hargaPromo ?? raw.promo ?? 0) || 0);
+            const promoStartDate = String(raw.promoStartDate || raw.mulai_promo || raw.startDate || '').trim();
+            const promoEndDate = String(raw.promoEndDate || raw.akhir_promo || raw.endDate || raw.promoEnd || '').trim();
+            const promoPeriod = String(raw.promoPeriod || raw.periode_promo || '').trim() ||
+                (typeof formatPromoPeriodRange === 'function' ? formatPromoPeriodRange(promoStartDate, promoEndDate) : '');
+            const imageUrl = String(raw.imageUrl || raw.customImage || raw.gambar || raw.foto || raw.image || '').trim();
+
+            return {
+                id: String(raw.id || ('ms_' + plu8)),
+                firestoreId: String(raw.firestoreId || raw.id || ''),
+                artCode: String(raw.artCode || plu8),
+                plu8,
+                packageBarcode,
+                name,
+                divisi,
+                category,
+                normalPrice,
+                price: normalPrice,
+                promoPrice,
+                promoStartDate,
+                promoEndDate,
+                promoPeriod,
+                imageUrl,
+                stockQty: raw.stockQty ?? raw.stok ?? raw.qty ?? raw.stock ?? null
+            };
+        }
+
+        function applyIncomingMasterStockItems(rawItems, silent = true) {
+            if (!Array.isArray(rawItems) || rawItems.length === 0) return false;
+            let changed = false;
+            rawItems.forEach((raw, idx) => {
+                const mapped = normalizeMasterStockRecordToYoPlano(raw, idx);
+                if (!mapped) return;
+
+                if (Array.isArray(DIVISI_LIST) && !DIVISI_LIST.includes(mapped.divisi)) {
+                    DIVISI_LIST.push(mapped.divisi);
+                    changed = true;
+                }
+                if (typeof CATEGORIES_BY_DIVISI === 'object') {
+                    CATEGORIES_BY_DIVISI[mapped.divisi] = CATEGORIES_BY_DIVISI[mapped.divisi] || [];
+                    if (!CATEGORIES_BY_DIVISI[mapped.divisi].includes(mapped.category)) {
+                        CATEGORIES_BY_DIVISI[mapped.divisi].push(mapped.category);
+                        changed = true;
+                    }
+                }
+
+                const existingIdx = skuCatalog.findIndex(s => s.plu8 === mapped.plu8);
+                if (existingIdx !== -1) {
+                    const cur = skuCatalog[existingIdx];
+                    if (
+                        cur.name !== mapped.name ||
+                        cur.divisi !== mapped.divisi ||
+                        cur.category !== mapped.category ||
+                        Number(cur.normalPrice) !== Number(mapped.normalPrice) ||
+                        Number(cur.promoPrice) !== Number(mapped.promoPrice) ||
+                        (mapped.promoEndDate && cur.promoEndDate !== mapped.promoEndDate) ||
+                        (mapped.packageBarcode && cur.packageBarcode !== mapped.packageBarcode) ||
+                        (mapped.firestoreId && cur.firestoreId !== mapped.firestoreId)
+                    ) {
+                        skuCatalog[existingIdx] = {
+                            ...cur,
+                            ...mapped,
+                            id: cur.id,
+                            firestoreId: mapped.firestoreId || cur.firestoreId || cur.id,
+                            promoStartDate: mapped.promoStartDate || cur.promoStartDate || '',
+                            promoEndDate: mapped.promoEndDate || cur.promoEndDate || '',
+                            promoPeriod: mapped.promoPeriod || cur.promoPeriod || '',
+                            imageUrl: mapped.imageUrl || cur.imageUrl || ''
+                        };
+                        changed = true;
+                    }
+                } else {
+                    skuCatalog.push(mapped);
+                    changed = true;
+                }
+            });
+
+            if (changed) {
+                if (typeof persistPluTaxonomy === 'function') persistPluTaxonomy();
+                if (typeof syncAllPrintQueuesWithCatalog === 'function') syncAllPrintQueuesWithCatalog();
+                if (typeof syncAutoSkuFromPlanogram === 'function') syncAutoSkuFromPlanogram(false);
+                saveData(false);
+                if (activeView === 'plu-barcode-link') renderPluBarcodeLinkModule(document.getElementById('mainContent'));
+                else if (activeView === 'master-article') renderMasterArticle(document.getElementById('mainContent'));
+                else if (activeView === 'promotion') renderPromotionModule(document.getElementById('mainContent'));
+                else if (activeView === 'sku-category') renderSkuCategoryPage(document.getElementById('mainContent'));
+            }
+
+            if (!silent) {
+                showToast(`Sinkronisasi Master Stock berhasil (${skuCatalog.length} SKU aktif)!`, 'fa-arrows-rotate', 'text-emerald-400');
+            }
+            return true;
+        }
+
+        async function pullCatalogFromMasterStock(silent = true) {
+            if (silent && (Date.now() - lastMasterStockWriteTs < 3000)) return false;
+
+            // Utamakan baca langsung dari Cloud Firestore Master Stok (master-stok-app -> master_products)
+            if (window.yoplanoMasterStokFirestoreBridge && typeof window.yoplanoMasterStokFirestoreBridge.pullAll === 'function') {
+                try {
+                    const fsItems = await window.yoplanoMasterStokFirestoreBridge.pullAll();
+                    if (Array.isArray(fsItems) && fsItems.length > 0) {
+                        return applyIncomingMasterStockItems(fsItems, silent);
+                    }
+                } catch (fsErr) {
+                    console.warn('Firestore Master Stok pull fallback:', fsErr);
+                }
+            }
+
+            const url = getMasterStockDbUrl();
+            if (!url) return false;
+
+            try {
+                const res = await fetch(`${url}/.json?t=${Date.now()}`);
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const rootData = await res.json();
+                if (!rootData) {
+                    await pushCatalogToMasterStock(true);
+                    return true;
+                }
+
+                const rawItems = extractItemsArrayFromMasterStockPayload(rootData);
+                return applyIncomingMasterStockItems(rawItems, silent);
+            } catch (err) {
+                if (!silent) {
+                    showToast('Gagal membaca database Master Stock. Periksa Rules/koneksi internet.', 'fa-triangle-exclamation', 'text-amber-400');
+                }
+                return false;
+            }
+        }
+
+        async function pushCatalogToMasterStock(silent = true) {
+            lastMasterStockWriteTs = Date.now();
+            let pushedFirestore = false;
+
+            // Dorong ke Cloud Firestore Master Stok (master-stok-app -> master_products) agar sinkron dengan Master Stok & YoPule
+            if (window.yoplanoMasterStokFirestoreBridge && typeof window.yoplanoMasterStokFirestoreBridge.pushCatalog === 'function') {
+                try {
+                    pushedFirestore = await window.yoplanoMasterStokFirestoreBridge.pushCatalog(skuCatalog);
+                } catch (fsErr) {
+                    console.warn('Firestore Master Stok push error:', fsErr);
+                }
+            }
+
+            const url = getMasterStockDbUrl();
+            if (!url) return pushedFirestore;
+            try {
+                const payloadItems = skuCatalog.map(item => ({
+                    id: item.id,
+                    plu8: item.plu8,
+                    plu: item.plu8,
+                    packageBarcode: item.packageBarcode || item.plu8,
+                    barcode: item.packageBarcode || item.plu8,
+                    name: item.name,
+                    nama: item.name,
+                    divisi: item.divisi,
+                    category: item.category,
+                    kategori: item.category,
+                    normalPrice: Number(item.normalPrice) || 0,
+                    harga: Number(item.normalPrice) || 0,
+                    promoPrice: Number(item.promoPrice) || 0,
+                    harga_promo: Number(item.promoPrice) || 0,
+                    promoStartDate: item.promoStartDate || '',
+                    promoEndDate: item.promoEndDate || '',
+                    promoPeriod: item.promoPeriod || '',
+                    imageUrl: item.imageUrl || '',
+                    updatedAt: new Date().toISOString()
+                }));
+
+                const res = await fetch(`${url}/yoplano_master_stock.json`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        items: payloadItems,
+                        source: 'YoPlano_Ungu',
+                        updatedAt: formatCurrentLoginTime(),
+                        updatedTs: Date.now()
+                    })
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                if (!silent) {
+                    showToast('Data harga & barang berhasil dikirim ke Master Stock!', 'fa-cloud-arrow-up', 'text-emerald-400');
+                }
+                return true;
+            } catch (err) {
+                if (pushedFirestore) {
+                    if (!silent) showToast('Data harga & barang berhasil disinkronkan ke Master Stok Firestore!', 'fa-cloud-arrow-up', 'text-emerald-400');
+                    return true;
+                }
+                if (!silent) {
+                    showToast('Gagal mengirim data ke Master Stock.', 'fa-triangle-exclamation', 'text-amber-400');
+                }
+                return false;
+            }
+        }
+
+        async function syncMasterStockTwoWay(silent = false) {
+            await pullCatalogFromMasterStock(true);
+            await pushCatalogToMasterStock(silent);
+        }
+
+        function normalizeCloudDbUrl(rawUrl) {
+            let clean = String(rawUrl || '').trim().replace(/\/+$/, '');
+            if (clean.endsWith('.json')) {
+                clean = clean.replace(/\/[^\/]+\.json$/, '');
+            }
+            return clean;
+        }
+
+        function detectUserDeviceLabel() {
+            const ua = navigator.userAgent || '';
+            let os = 'Desktop/Web';
+            if (/Android/i.test(ua)) os = 'HP Android';
+            else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iPhone / iOS';
+            else if (/Windows/i.test(ua)) os = 'PC Windows';
+            else if (/Mac/i.test(ua)) os = 'MacOS';
+
+            let browser = 'Browser';
+            if (/Edg\//i.test(ua)) browser = 'Edge';
+            else if (/Chrome\//i.test(ua)) browser = 'Chrome';
+            else if (/Firefox\//i.test(ua)) browser = 'Firefox';
+            else if (/Safari\//i.test(ua) && !/Chrome\//i.test(ua)) browser = 'Safari';
+
+            return `${browser} • ${os}`;
+        }
 
         function loadAuthData() {
+            try {
+                const urlParams = new URLSearchParams(window.location.search);
+                const cloudFromUrl = urlParams.get('cloud');
+                if (cloudFromUrl && cloudFromUrl.startsWith('http')) {
+                    localStorage.setItem('yoplano_cloud_db_url_v1', normalizeCloudDbUrl(cloudFromUrl));
+                }
+            } catch (e) {}
+
+            try {
+                yoplanoCloudDbUrl = normalizeCloudDbUrl(
+                    localStorage.getItem('yoplano_cloud_db_url_v1') || EMBEDDED_CLOUD_DB_URL || ''
+                );
+            } catch (e) {
+                yoplanoCloudDbUrl = normalizeCloudDbUrl(EMBEDDED_CLOUD_DB_URL || '');
+            }
+
             try {
                 const savedUsers = JSON.parse(localStorage.getItem('yoplano_users_v2') || 'null');
                 if (Array.isArray(savedUsers) && savedUsers.length > 0) {
@@ -10415,6 +10733,17 @@
                 }
             } catch (e) {
                 yoplanoUsers = JSON.parse(JSON.stringify(DEFAULT_YOPLANO_USERS));
+            }
+
+            try {
+                const savedLogs = JSON.parse(localStorage.getItem('yoplano_login_logs_v1') || 'null');
+                if (Array.isArray(savedLogs)) {
+                    yoplanoLoginLogs = savedLogs;
+                } else {
+                    yoplanoLoginLogs = [];
+                }
+            } catch (e) {
+                yoplanoLoginLogs = [];
             }
 
             try {
@@ -10430,13 +10759,85 @@
             }
         }
 
-        function saveAuthData() {
+        let lastLocalAuthWriteTs = 0;
+
+        function saveAuthData(pushCloud = true) {
+            lastLocalAuthWriteTs = Date.now();
             try {
                 localStorage.setItem('yoplano_users_v2', JSON.stringify(yoplanoUsers));
+                localStorage.setItem('yoplano_login_logs_v1', JSON.stringify(yoplanoLoginLogs));
                 if (currentUser) {
                     localStorage.setItem('yoplano_current_user_v2', JSON.stringify(currentUser));
                 }
             } catch (e) {}
+            if (pushCloud && yoplanoCloudDbUrl) {
+                pushAuthDataToCloud(true);
+            }
+        }
+
+        async function pushAuthDataToCloud(silent = true, useKeepalive = false) {
+            if (!yoplanoCloudDbUrl) return false;
+            try {
+                const endpoint = `${yoplanoCloudDbUrl}/yoplano_auth_state.json`;
+                const payload = {
+                    users: yoplanoUsers,
+                    loginLogs: yoplanoLoginLogs.slice(0, 100),
+                    updatedAt: formatCurrentLoginTime(),
+                    updatedTs: Date.now()
+                };
+                const res = await fetch(endpoint, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    keepalive: !!useKeepalive
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                if (!silent) showToast('Data User & Riwayat Login berhasil disinkronkan ke Cloud!', 'fa-cloud-arrow-up', 'text-emerald-400');
+                return true;
+            } catch (err) {
+                if (!silent) alert('Gagal menghubungi Cloud Database. Pastikan URL Firebase Realtime Database benar dan Rules diset ke true.');
+                return false;
+            }
+        }
+
+        async function pullAuthDataFromCloud(silent = true) {
+            if (!yoplanoCloudDbUrl) return false;
+            if (silent && (Date.now() - lastLocalAuthWriteTs < 3000)) {
+                return false;
+            }
+            try {
+                const endpoint = `${yoplanoCloudDbUrl}/yoplano_auth_state.json?t=${Date.now()}`;
+                const res = await fetch(endpoint);
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                if (data && Array.isArray(data.users) && data.users.length > 0) {
+                    yoplanoUsers = data.users;
+                    if (Array.isArray(data.loginLogs)) {
+                        yoplanoLoginLogs = data.loginLogs;
+                    }
+                    if (currentUser) {
+                        const updatedSelf = yoplanoUsers.find(u => u.id === currentUser.id || String(u.username) === String(currentUser.username));
+                        if (updatedSelf) currentUser = { ...updatedSelf };
+                    }
+                    saveAuthData(false);
+                    updateHeaderAndSidebarAuthUI();
+                    if (activeView === 'master-user') {
+                        renderMasterUserTableBody();
+                        renderMasterUserLoginLogsBody();
+                    } else if (activeView === 'dashboard') {
+                        renderDashboard(document.getElementById('mainContent'));
+                    }
+                    if (!silent) showToast('Data terbaru berhasil ditarik dari Cloud Database!', 'fa-cloud-arrow-down', 'text-indigo-400');
+                    return true;
+                } else {
+                    // Jika Cloud masih kosong, kirim data lokal pertama kali ke Cloud
+                    await pushAuthDataToCloud(true);
+                    return true;
+                }
+            } catch (err) {
+                if (!silent) showToast('Belum dapat menarik data Cloud, menggunakan data lokal', 'fa-triangle-exclamation', 'text-amber-400');
+                return false;
+            }
         }
 
         function getInitialsFromName(name) {
@@ -10492,8 +10893,17 @@
         }
 
         function openLoginOverlay() {
+            if (yoplanoCloudDbUrl) {
+                pullAuthDataFromCloud(true);
+            }
             const overlay = document.getElementById('loginOverlay');
             const errBox = document.getElementById('loginErrorBox');
+            const cloudHint = document.getElementById('loginCloudStatusHint');
+            if (cloudHint) {
+                cloudHint.innerHTML = yoplanoCloudDbUrl
+                    ? `<span class="text-emerald-600"><i class="fa-solid fa-cloud-bolt mr-1"></i>Terhubung Cloud Realtime Database</span>`
+                    : `<span class="text-amber-600"><i class="fa-solid fa-laptop mr-1"></i>Mode Lokal (Belum terhubung Cloud Firebase)</span>`;
+            }
             if (errBox) errBox.classList.add('hidden');
             if (overlay) {
                 overlay.classList.remove('hidden');
@@ -10510,10 +10920,64 @@
             if (overlay) overlay.classList.add('hidden');
         }
 
-        function handleLogout() {
-            localStorage.removeItem('yoplano_session_active_v1');
+        let isYoPlanoPrinting = false;
+
+        function performAutoLogout(reasonMsg = '', useKeepalive = false) {
+            if (!sessionStorage.getItem('yoplano_tab_session_v1')) return;
+            if (currentUser) {
+                const nowStr = formatCurrentLoginTime();
+                const uIdx = yoplanoUsers.findIndex(u => u.id === currentUser.id);
+                if (uIdx !== -1) {
+                    yoplanoUsers[uIdx].isOnline = false;
+                    yoplanoUsers[uIdx].lastLogoutText = nowStr;
+                }
+                const activeLog = yoplanoLoginLogs.find(l => l.userId === currentUser.id && l.status === 'ONLINE');
+                if (activeLog) {
+                    activeLog.status = 'LOGOUT';
+                    activeLog.logoutTime = nowStr;
+                }
+                lastLocalAuthWriteTs = Date.now();
+                try {
+                    localStorage.setItem('yoplano_users_v2', JSON.stringify(yoplanoUsers));
+                    localStorage.setItem('yoplano_login_logs_v1', JSON.stringify(yoplanoLoginLogs));
+                } catch (e) {}
+                if (yoplanoCloudDbUrl) {
+                    pushAuthDataToCloud(true, useKeepalive);
+                }
+            }
+            try {
+                sessionStorage.removeItem('yoplano_tab_session_v1');
+                localStorage.removeItem('yoplano_session_active_v1');
+            } catch (e) {}
             openLoginOverlay();
-            showToast('Silakan login kembali dengan ID User & Password', 'fa-right-from-bracket', 'text-indigo-400');
+            if (reasonMsg) {
+                const errBox = document.getElementById('loginErrorBox');
+                const errTxt = document.getElementById('loginErrorText');
+                if (errTxt) errTxt.textContent = reasonMsg;
+                if (errBox) errBox.classList.remove('hidden');
+            }
+        }
+
+        async function handleLogout() {
+            if (currentUser) {
+                const uIdx = yoplanoUsers.findIndex(u => u.id === currentUser.id);
+                if (uIdx !== -1) {
+                    yoplanoUsers[uIdx].isOnline = false;
+                    yoplanoUsers[uIdx].lastLogoutText = formatCurrentLoginTime();
+                }
+                const activeLog = yoplanoLoginLogs.find(l => l.userId === currentUser.id && l.status === 'ONLINE');
+                if (activeLog) {
+                    activeLog.status = 'LOGOUT';
+                    activeLog.logoutTime = formatCurrentLoginTime();
+                }
+                saveAuthData(true);
+            }
+            try {
+                sessionStorage.removeItem('yoplano_tab_session_v1');
+                localStorage.removeItem('yoplano_session_active_v1');
+            } catch (e) {}
+            openLoginOverlay();
+            showToast('Anda telah Logout. Silakan login kembali dengan ID User & Password', 'fa-right-from-bracket', 'text-indigo-400');
         }
 
         function toggleLoginPasswordVisibility() {
@@ -10529,8 +10993,11 @@
             }
         }
 
-        function handleLoginSubmit(e) {
+        async function handleLoginSubmit(e) {
             if (e) e.preventDefault();
+            if (yoplanoCloudDbUrl) {
+                await pullAuthDataFromCloud(true);
+            }
             const inputId = (document.getElementById('loginUsernameInput')?.value || '').trim().toLowerCase();
             const password = (document.getElementById('loginPasswordInput')?.value || '').trim();
 
@@ -10542,7 +11009,7 @@
             if (!found) {
                 const errBox = document.getElementById('loginErrorBox');
                 const errTxt = document.getElementById('loginErrorText');
-                if (errTxt) errTxt.textContent = 'ID User atau Password salah! Contoh: ID 224125043 dan Password 123456.';
+                if (errTxt) errTxt.textContent = 'ID User atau Password salah! Pastikan ID sudah terdaftar di Master User.';
                 if (errBox) errBox.classList.remove('hidden');
                 return;
             }
@@ -10569,15 +11036,50 @@
             return `${dd} ${mm} ${yyyy} ${hh}:${min}`;
         }
 
-        function loginWithUserObject(userObj) {
+        async function loginWithUserObject(userObj) {
+            if (yoplanoCloudDbUrl) {
+                await pullAuthDataFromCloud(true);
+                const latest = yoplanoUsers.find(u => u.id === userObj.id || String(u.username) === String(userObj.username));
+                if (latest) userObj = latest;
+            }
             const loginTimeStr = formatCurrentLoginTime();
-            currentUser = { ...userObj, lastLoginText: loginTimeStr };
+            const deviceLabel = detectUserDeviceLabel();
+            currentUser = {
+                ...userObj,
+                isOnline: true,
+                lastLoginText: loginTimeStr,
+                lastLoginTs: Date.now(),
+                lastDevice: deviceLabel
+            };
             const uIdx = yoplanoUsers.findIndex(u => u.id === currentUser.id);
             if (uIdx !== -1) {
+                yoplanoUsers[uIdx].isOnline = true;
                 yoplanoUsers[uIdx].lastLoginText = loginTimeStr;
+                yoplanoUsers[uIdx].lastLoginTs = Date.now();
+                yoplanoUsers[uIdx].lastDevice = deviceLabel;
             }
-            saveAuthData();
-            try { localStorage.setItem('yoplano_session_active_v1', '1'); } catch (e) {}
+
+            // Catat ke Riwayat Siapa Saja yang Login
+            yoplanoLoginLogs.unshift({
+                logId: 'log_' + Date.now(),
+                userId: currentUser.id,
+                username: currentUser.username,
+                fullName: currentUser.fullName,
+                role: currentUser.role,
+                storeCode: currentUser.storeCode || '205 - YPC YOGYA PLAZA CIMAHI',
+                loginTime: loginTimeStr,
+                device: deviceLabel,
+                status: 'ONLINE'
+            });
+            if (yoplanoLoginLogs.length > 100) {
+                yoplanoLoginLogs = yoplanoLoginLogs.slice(0, 100);
+            }
+
+            saveAuthData(true);
+            try {
+                sessionStorage.setItem('yoplano_tab_session_v1', '1');
+                localStorage.setItem('yoplano_session_active_v1', '1');
+            } catch (e) {}
             updateHeaderAndSidebarAuthUI();
             closeLoginOverlay();
 
@@ -10857,14 +11359,34 @@
             if (!file) return;
             const reader = new FileReader();
             reader.onload = function(ev) {
-                const dataUrl = ev.target.result;
-                const hiddenInput = document.getElementById('editProfileAvatarData');
-                if (hiddenInput) hiddenInput.value = dataUrl;
-                const preview = document.getElementById('profileCardAvatarPreview');
-                if (preview) {
-                    preview.innerHTML = `<img src="${dataUrl}" alt="Avatar" class="w-full h-full object-cover">`;
-                }
-                showToast('Foto profil siap disimpan, klik Simpan Perubahan Profil', 'fa-image', 'text-indigo-400');
+                const img = new Image();
+                img.onload = function() {
+                    const maxDim = 180;
+                    let w = img.width;
+                    let h = img.height;
+                    if (w > h && w > maxDim) {
+                        h = Math.round(h * (maxDim / w));
+                        w = maxDim;
+                    } else if (h >= w && h > maxDim) {
+                        w = Math.round(w * (maxDim / h));
+                        h = maxDim;
+                    }
+                    const canvas = document.createElement('canvas');
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, w, h);
+                    const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+
+                    const hiddenInput = document.getElementById('editProfileAvatarData');
+                    if (hiddenInput) hiddenInput.value = compressedDataUrl;
+                    const preview = document.getElementById('profileCardAvatarPreview');
+                    if (preview) {
+                        preview.innerHTML = `<img src="${compressedDataUrl}" alt="Avatar" class="w-full h-full object-cover">`;
+                    }
+                    showToast('Foto profil siap disimpan, klik Simpan Perubahan Profil', 'fa-image', 'text-indigo-400');
+                };
+                img.src = ev.target.result;
             };
             reader.readAsDataURL(file);
         }
@@ -10880,9 +11402,12 @@
             showToast('Avatar direset ke inisial nama', 'fa-rotate-left', 'text-amber-400');
         }
 
-        function saveMyProfile(e) {
+        async function saveMyProfile(e) {
             if (e) e.preventDefault();
             if (!currentUser) loadAuthData();
+            if (yoplanoCloudDbUrl) {
+                await pullAuthDataFromCloud(true);
+            }
 
             const fullName = (document.getElementById('editProfileFullName')?.value || '').trim();
             const nik = (document.getElementById('editProfileNik')?.value || '').trim();
@@ -10950,44 +11475,100 @@
                 return;
             }
 
+            if (yoplanoCloudDbUrl) {
+                pullAuthDataFromCloud(true);
+            }
+
             const editingUser = masterUserEditingId ? yoplanoUsers.find(u => u.id === masterUserEditingId) : null;
             const totalUsers = yoplanoUsers.length;
             const totalAdmin = yoplanoUsers.filter(u => u.role === 'ADMIN_MASTER').length;
             const totalRegular = yoplanoUsers.filter(u => u.role === 'USER').length;
+            const totalOnline = yoplanoUsers.filter(u => u.isOnline).length;
+            const isCloudConnected = !!yoplanoCloudDbUrl;
 
             container.innerHTML = `
                 <div class="space-y-6">
                     <!-- HEADER BANNER & RINGKASAN -->
                     <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
                         <div>
-                            <div class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-extrabold uppercase tracking-wider mb-2">
-                                <i class="fa-solid fa-shield-halved"></i>
-                                <span>Manajemen Akun & Hak Akses Login</span>
+                            <div class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full ${isCloudConnected ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-indigo-50 text-indigo-700 border-indigo-200'} border text-[10px] font-extrabold uppercase tracking-wider mb-2">
+                                <i class="fa-solid ${isCloudConnected ? 'fa-cloud-bolt' : 'fa-shield-halved'}"></i>
+                                <span>${isCloudConnected ? 'Cloud Realtime Sync Aktif' : 'Manajemen Akun & Monitoring Login'}</span>
                             </div>
                             <h1 class="text-xl font-black text-slate-800 tracking-tight flex items-center gap-2">
                                 <i class="fa-solid fa-users-gear text-indigo-600"></i>
-                                <span>Master User (Kelola ID Login, Password & Role)</span>
+                                <span>Master User (Kelola ID Terdaftar & Monitor Siapa Saja yang Login)</span>
                             </h1>
-                            <p class="text-xs text-slate-500 mt-1">Tambahkan, edit, atau hapus akun user untuk login menggunakan <b>ID User</b> (contoh: <code class="font-mono font-bold text-indigo-600">224125043</code>) dan <b>Password</b> (contoh: <code class="font-mono font-bold text-indigo-600">123456</code>), serta atur hak akses <b>Admin Master</b> atau <b>User Biasa</b>.</p>
+                            <p class="text-xs text-slate-500 mt-1">Tambahkan ID User & Password untuk orang lain, pantau daftar seluruh ID yang terdaftar, dan lihat secara langsung siapa saja yang sedang login beserta perangkatnya.</p>
                         </div>
                         <div class="flex flex-wrap items-center gap-2.5">
                             <div class="px-3.5 py-2 rounded-xl bg-slate-50 border border-slate-200 text-center">
-                                <div class="text-[10px] font-bold text-slate-400 uppercase">Total Akun</div>
-                                <div class="text-sm font-black text-slate-800">${totalUsers} User</div>
-                            </div>
-                            <div class="px-3.5 py-2 rounded-xl bg-indigo-50 border border-indigo-200 text-center">
-                                <div class="text-[10px] font-bold text-indigo-500 uppercase">Admin Master</div>
-                                <div class="text-sm font-black text-indigo-700">${totalAdmin} Akun</div>
+                                <div class="text-[10px] font-bold text-slate-400 uppercase">Total Terdaftar</div>
+                                <div class="text-sm font-black text-slate-800">${totalUsers} ID</div>
                             </div>
                             <div class="px-3.5 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-center">
-                                <div class="text-[10px] font-bold text-emerald-600 uppercase">User Biasa</div>
-                                <div class="text-sm font-black text-emerald-700">${totalRegular} Akun</div>
+                                <div class="text-[10px] font-bold text-emerald-600 uppercase">Sedang Login</div>
+                                <div class="text-sm font-black text-emerald-700">${totalOnline} Online</div>
+                            </div>
+                            <div class="px-3.5 py-2 rounded-xl bg-indigo-50 border border-indigo-200 text-center">
+                                <div class="text-[10px] font-bold text-indigo-500 uppercase">Admin / User</div>
+                                <div class="text-sm font-black text-indigo-700">${totalAdmin} / ${totalRegular}</div>
                             </div>
                             <button onclick="openMasterUserModal()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold px-4 py-2.5 rounded-xl text-xs shadow transition flex items-center gap-2">
                                 <i class="fa-solid fa-user-plus"></i>
                                 <span>+ Tambah User (Popup)</span>
                             </button>
                         </div>
+                    </div>
+
+                    <!-- PANEL SINKRONISASI CLOUD REALTIME ANTAR PERANGKAT (FIREBASE REALTIME DB) -->
+                    <div class="bg-white rounded-2xl border-2 ${isCloudConnected ? 'border-emerald-300' : 'border-indigo-200'} p-5 shadow-sm space-y-4">
+                        <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3 pb-3 border-b border-slate-100">
+                            <div class="flex items-start gap-3">
+                                <div class="w-10 h-10 rounded-xl ${isCloudConnected ? 'bg-emerald-600' : 'bg-indigo-600'} text-white flex items-center justify-center shrink-0 shadow">
+                                    <i class="fa-solid fa-cloud-arrow-up text-sm"></i>
+                                </div>
+                                <div>
+                                    <div class="flex items-center gap-2">
+                                        <h3 class="text-sm font-black text-slate-800">Sinkronisasi Cloud Lintas Perangkat (Firebase Realtime Database)</h3>
+                                        <span class="px-2 py-0.5 rounded-full text-[10px] font-extrabold ${isCloudConnected ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}">
+                                            ${isCloudConnected ? '● TERHUBUNG CLOUD' : '○ MODE LOKAL (BELUM DIHUBUNGKAN)'}
+                                        </span>
+                                    </div>
+                                    <p class="text-[11px] text-slate-500 mt-0.5">Agar ID yang Anda tambahkan bisa dipakai login oleh orang lain di HP/komputer mereka dan aktivitas login mereka terlihat di menu Anda, masukkan URL <b>Firebase Realtime Database</b> di bawah ini.</p>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-2 shrink-0">
+                                <button type="button" onclick="pullAuthDataFromCloud(false)" class="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 text-xs font-extrabold transition flex items-center gap-1.5">
+                                    <i class="fa-solid fa-arrows-rotate text-indigo-600"></i>
+                                    <span>Refresh Data Cloud</span>
+                                </button>
+                                ${isCloudConnected ? `
+                                    <button type="button" onclick="downloadCloudEmbeddedIndexHtml()" class="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-extrabold shadow transition flex items-center gap-1.5" title="Download file index.html yang sudah ditanamkan URL Cloud ini untuk diupload ke GitHub">
+                                        <i class="fa-solid fa-download"></i>
+                                        <span>Download index.html (Siap GitHub)</span>
+                                    </button>
+                                ` : ''}
+                            </div>
+                        </div>
+
+                        <form onsubmit="saveCloudDbConfig(event)" class="grid grid-cols-1 lg:grid-cols-4 gap-3 items-end">
+                            <div class="lg:col-span-3">
+                                <label class="block text-[11px] font-extrabold text-slate-700 uppercase mb-1">URL Firebase Realtime Database (Gratis di console.firebase.google.com)</label>
+                                <input type="url" id="cloudDbUrlInput" value="${escapeHtml(yoplanoCloudDbUrl)}" placeholder="Contoh: https://yoplano-ypc205-default-rtdb.asia-southeast1.firebasedatabase.app" class="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold px-4 py-2 rounded-xl text-xs shadow transition flex items-center justify-center gap-1.5">
+                                    <i class="fa-solid fa-link"></i>
+                                    <span>Simpan & Sync Cloud</span>
+                                </button>
+                                ${isCloudConnected ? `
+                                    <button type="button" onclick="copyCloudInviteLink()" title="Salin Link Website untuk Orang Lain" class="px-3 py-2 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-extrabold shrink-0">
+                                        <i class="fa-solid fa-share-nodes mr-1"></i>Salin Link
+                                    </button>
+                                ` : ''}
+                            </div>
+                        </form>
                     </div>
 
                     <!-- FORM LANGSUNG TAMBAH / EDIT USER LOGIN -->
@@ -11048,7 +11629,7 @@
                                 <div class="text-[11px] text-slate-500 flex items-center gap-2">
                                     <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 font-bold">Admin Master:</span> Akses Penuh Semua Menu
                                     <span class="text-slate-300">|</span>
-                                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold">User Biasa:</span> Print All POP (A6/A4/A3), SKU, SKU Category, Planogram, Master Article & Profil
+                                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 font-bold">User Biasa:</span> Dashboard, Print All POP (A6/A4/A3), SKU, SKU Category, Planogram, Master Article & Profil
                                 </div>
                                 <div class="flex items-center gap-2">
                                     ${editingUser ? `
@@ -11065,22 +11646,22 @@
                         </form>
                     </div>
 
-                    <!-- TABEL DAFTAR USER LOGIN -->
+                    <!-- TABEL DAFTAR ID USER TERDAFTAR & STATUS LOGIN -->
                     <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
                         <div class="p-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-slate-50/60">
-                            <div class="flex items-center gap-2">
+                            <div class="flex flex-wrap items-center gap-2">
                                 <div class="relative w-64">
                                     <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
-                                    <input type="text" id="masterUserSearchInput" value="${escapeHtml(masterUserSearchQuery)}" oninput="masterUserSearchQuery=this.value; renderMasterUserTableBody();" placeholder="Cari ID (224125043) / Nama..." class="w-full pl-8 pr-3 py-1.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-700 bg-white focus:outline-none focus:border-indigo-500">
+                                    <input type="text" id="masterUserSearchInput" value="${escapeHtml(masterUserSearchQuery)}" oninput="masterUserSearchQuery=this.value; renderMasterUserTableBody();" placeholder="Cari ID Terdaftar (224125043) / Nama..." class="w-full pl-8 pr-3 py-1.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-700 bg-white focus:outline-none focus:border-indigo-500">
                                 </div>
                                 <select onchange="masterUserRoleFilter=this.value; renderMasterUserTableBody();" class="px-3 py-1.5 border border-slate-300 rounded-xl text-xs font-extrabold text-slate-700 bg-white focus:outline-none focus:border-indigo-500">
-                                    <option value="ALL" ${masterUserRoleFilter === 'ALL' ? 'selected' : ''}>Semua Role (${totalUsers})</option>
+                                    <option value="ALL" ${masterUserRoleFilter === 'ALL' ? 'selected' : ''}>Semua ID Terdaftar (${totalUsers})</option>
                                     <option value="ADMIN_MASTER" ${masterUserRoleFilter === 'ADMIN_MASTER' ? 'selected' : ''}>Admin Master (${totalAdmin})</option>
                                     <option value="USER" ${masterUserRoleFilter === 'USER' ? 'selected' : ''}>User Biasa (${totalRegular})</option>
                                 </select>
                             </div>
                             <div class="text-xs font-bold text-slate-500">
-                                Klik <b>Edit</b> untuk mengubah ID/Password, atau ubah <b>Role</b> langsung pada kolom Role.
+                                Daftar seluruh ID User yang terdaftar beserta status login terakhirnya.
                             </div>
                         </div>
 
@@ -11089,15 +11670,56 @@
                                 <thead>
                                     <tr class="bg-slate-900 text-white text-[11px] font-extrabold uppercase tracking-wider">
                                         <th class="p-3.5 text-center w-12">No</th>
-                                        <th class="p-3.5">ID User Login</th>
+                                        <th class="p-3.5">ID User Terdaftar</th>
                                         <th class="p-3.5">Password Login</th>
                                         <th class="p-3.5">Nama Lengkap & Jabatan</th>
-                                        <th class="p-3.5">Pilih Role (Admin Master / User Biasa)</th>
-                                        <th class="p-3.5">Cabang / Store</th>
-                                        <th class="p-3.5 text-right">Aksi (Tambah / Edit / Hapus)</th>
+                                        <th class="p-3.5">Role (Admin Master / User Biasa)</th>
+                                        <th class="p-3.5">Status Login & Perangkat</th>
+                                        <th class="p-3.5 text-right">Aksi (Edit / Hapus)</th>
                                     </tr>
                                 </thead>
                                 <tbody id="masterUserTableBody">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- TABEL RIWAYAT SIAPA SAJA YANG LOGIN (LIVE LOGIN ACTIVITY MONITOR) -->
+                    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                        <div class="p-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-slate-50/60">
+                            <div>
+                                <h3 class="text-xs font-black uppercase tracking-wider text-slate-800 flex items-center gap-2">
+                                    <i class="fa-solid fa-user-clock text-emerald-600"></i>
+                                    <span>Monitoring & Riwayat Siapa Saja yang Login (${yoplanoLoginLogs.length} Aktivitas)</span>
+                                </h3>
+                                <p class="text-[11px] text-slate-500 mt-0.5">Menampilkan daftar real-time siapa saja yang login ke aplikasi beserta waktu dan perangkat yang digunakan.</p>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <button onclick="pullAuthDataFromCloud(false)" class="px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-extrabold transition flex items-center gap-1.5">
+                                    <i class="fa-solid fa-rotate"></i>
+                                    <span>Refresh Aktivitas</span>
+                                </button>
+                                <button onclick="clearLoginActivityLogs()" class="px-3 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 text-xs font-extrabold transition flex items-center gap-1.5">
+                                    <i class="fa-solid fa-broom"></i>
+                                    <span>Bersihkan Log</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead>
+                                    <tr class="bg-slate-800 text-white text-[11px] font-extrabold uppercase tracking-wider">
+                                        <th class="p-3 text-center w-12">No</th>
+                                        <th class="p-3">Waktu Login</th>
+                                        <th class="p-3">ID User</th>
+                                        <th class="p-3">Nama User & Cabang</th>
+                                        <th class="p-3">Role Akses</th>
+                                        <th class="p-3">Perangkat / Browser</th>
+                                        <th class="p-3 text-center">Status Sesi</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="masterUserLoginLogsBody">
                                 </tbody>
                             </table>
                         </div>
@@ -11106,6 +11728,7 @@
             `;
 
             renderMasterUserTableBody();
+            renderMasterUserLoginLogsBody();
         }
 
         function renderMasterUserTableBody() {
@@ -11141,6 +11764,10 @@
                 const initials = getInitialsFromName(u.fullName);
                 const showPass = !!masterUserShowPassMap[u.id];
                 const maskedPass = '•'.repeat(Math.max(6, String(u.password || '').length));
+                const isOnline = !!u.isOnline || isCurrent;
+                const displayLoginText = u.lastLoginText || (isCurrent ? (currentUser.lastLoginText || formatCurrentLoginTime()) : '');
+                const displayDevice = u.lastDevice || (isCurrent ? (currentUser.lastDevice || detectUserDeviceLabel()) : '');
+                const deviceIconClass = /android|iphone|ipad/i.test(displayDevice) ? 'fa-mobile-screen-button' : 'fa-laptop';
 
                 return `
                     <tr class="hover:bg-slate-50 border-b border-slate-100 transition">
@@ -11167,9 +11794,9 @@
                                 <div>
                                     <div class="font-extrabold text-slate-800 text-xs flex items-center gap-1.5">
                                         <span>${escapeHtml(u.fullName)}</span>
-                                        ${isCurrent ? `<span class="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-black">AKTIF LOGIN</span>` : ''}
+                                        ${isCurrent ? `<span class="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-black">ANDA</span>` : ''}
                                     </div>
-                                    <div class="text-[11px] text-slate-500">${escapeHtml(u.jabatan || '-')}</div>
+                                    <div class="text-[11px] text-slate-500">${escapeHtml(u.jabatan || '-')} • ${escapeHtml(u.storeCode || '-')}</div>
                                 </div>
                             </div>
                         </td>
@@ -11179,7 +11806,19 @@
                                 <option value="USER" ${!isAdmin ? 'selected' : ''}>USER BIASA (Terbatas)</option>
                             </select>
                         </td>
-                        <td class="p-3.5 text-xs font-semibold text-slate-600">${escapeHtml(u.storeCode || '-')}</td>
+                        <td class="p-3.5">
+                            <div class="flex flex-col gap-1">
+                                <div>
+                                    ${isOnline
+                                        ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-700 border border-emerald-200"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span> SEDANG LOGIN</span>`
+                                        : `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-500 border border-slate-200">OFFLINE</span>`}
+                                </div>
+                                <div class="text-[10px] font-semibold text-slate-500">
+                                    ${displayLoginText ? `Login: ${escapeHtml(displayLoginText)}` : 'Belum pernah login'}
+                                </div>
+                                ${displayDevice ? `<div class="text-[10px] font-bold text-indigo-600"><i class="fa-solid ${deviceIconClass} mr-1"></i>${escapeHtml(displayDevice)}</div>` : ''}
+                            </div>
+                        </td>
                         <td class="p-3.5 text-right">
                             <div class="inline-flex items-center gap-1.5">
                                 <button onclick="loginWithUserObject(yoplanoUsers.find(x => x.id === '${u.id}'))" title="Tes Login dengan Akun Ini" class="px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[11px] font-extrabold transition">
@@ -11201,6 +11840,129 @@
                     </tr>
                 `;
             }).join('');
+        }
+
+        function renderMasterUserLoginLogsBody() {
+            const tbody = document.getElementById('masterUserLoginLogsBody');
+            if (!tbody) return;
+
+            if (!Array.isArray(yoplanoLoginLogs) || yoplanoLoginLogs.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="7" class="p-8 text-center text-xs font-bold text-slate-400">
+                            Belum ada riwayat aktivitas login yang tercatat.
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = yoplanoLoginLogs.slice(0, 50).map((log, idx) => {
+                const isAdmin = log.role === 'ADMIN_MASTER';
+                const isOnline = log.status === 'ONLINE';
+                return `
+                    <tr class="hover:bg-slate-50 border-b border-slate-100 text-xs">
+                        <td class="p-3 text-center font-bold text-slate-400">${idx + 1}</td>
+                        <td class="p-3 font-bold text-slate-700">
+                            <div><i class="fa-regular fa-clock text-indigo-500 mr-1"></i>${escapeHtml(log.loginTime || '-')}</div>
+                            ${log.logoutTime ? `<div class="text-[10px] text-slate-400 mt-0.5">Logout: ${escapeHtml(log.logoutTime)}</div>` : ''}
+                        </td>
+                        <td class="p-3">
+                            <span class="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono font-black text-indigo-700">${escapeHtml(log.username || '-')}</span>
+                        </td>
+                        <td class="p-3">
+                            <div class="font-extrabold text-slate-800 uppercase">${escapeHtml(log.fullName || '-')}</div>
+                            <div class="text-[10px] text-slate-500">${escapeHtml(log.storeCode || '205 - YPC YOGYA PLAZA CIMAHI')}</div>
+                        </td>
+                        <td class="p-3">
+                            <span class="px-2 py-0.5 rounded-full text-[10px] font-extrabold ${isAdmin ? 'bg-indigo-100 text-indigo-700' : 'bg-emerald-100 text-emerald-700'}">
+                                ${isAdmin ? 'ADMIN MASTER' : 'USER BIASA'}
+                            </span>
+                        </td>
+                        <td class="p-3 font-semibold text-slate-600">
+                            <i class="fa-solid fa-display text-slate-400 mr-1"></i>${escapeHtml(log.device || 'Web Browser')}
+                        </td>
+                        <td class="p-3 text-center">
+                            ${isOnline
+                                ? `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-700 border border-emerald-200"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span> SEDANG LOGIN</span>`
+                                : `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-500">SUDAH LOGOUT</span>`}
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        async function saveCloudDbConfig(e) {
+            if (e) e.preventDefault();
+            const raw = (document.getElementById('cloudDbUrlInput')?.value || '').trim();
+            const cleaned = normalizeCloudDbUrl(raw);
+            yoplanoCloudDbUrl = cleaned;
+            try {
+                if (cleaned) {
+                    localStorage.setItem('yoplano_cloud_db_url_v1', cleaned);
+                } else {
+                    localStorage.removeItem('yoplano_cloud_db_url_v1');
+                }
+            } catch (err) {}
+
+            if (cleaned) {
+                const ok = await pushAuthDataToCloud(false);
+                if (ok) {
+                    await pullAuthDataFromCloud(true);
+                }
+            } else {
+                showToast('Mode Cloud dinonaktifkan (Kembali ke penyimpanan lokal)', 'fa-cloud', 'text-amber-400');
+            }
+            renderMasterUser(document.getElementById('mainContent'));
+        }
+
+        function copyCloudInviteLink() {
+            if (!yoplanoCloudDbUrl) return alert('Masukkan dan simpan URL Firebase Realtime Database terlebih dahulu!');
+            const baseUrl = window.location.origin + window.location.pathname;
+            const shareUrl = `${baseUrl}?cloud=${encodeURIComponent(yoplanoCloudDbUrl)}`;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(shareUrl);
+                showToast('Link akses terhubung Cloud berhasil disalin!', 'fa-copy', 'text-emerald-400');
+            } else {
+                prompt('Salin link ini dan berikan kepada user lain:', shareUrl);
+            }
+        }
+
+        function downloadCloudEmbeddedIndexHtml() {
+            if (!yoplanoCloudDbUrl) return alert('Masukkan dan simpan URL Firebase Realtime Database terlebih dahulu!');
+            const cloneDoc = document.documentElement.cloneNode(true);
+            const mainEl = cloneDoc.querySelector('#mainContent');
+            if (mainEl) mainEl.innerHTML = '';
+            const printEl = cloneDoc.querySelector('#printContainer');
+            if (printEl) printEl.innerHTML = '';
+            const modalEl = cloneDoc.querySelector('#modalOverlay');
+            if (modalEl) modalEl.classList.add('hidden');
+            const loginEl = cloneDoc.querySelector('#loginOverlay');
+            if (loginEl) loginEl.classList.add('hidden');
+
+            let fullHtml = '<!DOCTYPE html>\n' + cloneDoc.outerHTML;
+            fullHtml = fullHtml.replace(
+                /const EMBEDDED_CLOUD_DB_URL = "[^"]*";/,
+                `const EMBEDDED_CLOUD_DB_URL = "${yoplanoCloudDbUrl}";`
+            );
+            const blob = new Blob([fullHtml], { type: 'text/html;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'index.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            showToast('File index.html (terhubung Cloud) berhasil didownload! Upload file ini ke GitHub.', 'fa-download', 'text-emerald-400');
+        }
+
+        function clearLoginActivityLogs() {
+            if (!confirm('Bersihkan daftar riwayat log login?')) return;
+            yoplanoLoginLogs = [];
+            saveAuthData(true);
+            renderMasterUserLoginLogsBody();
+            showToast('Riwayat aktivitas login dibersihkan', 'fa-broom', 'text-amber-400');
         }
 
         function toggleMasterUserPass(userId) {
@@ -11284,12 +12046,14 @@
                     storeSub: 'YPC YOGYA PLAZA CIMAHI',
                     email: '',
                     phone: '',
-                    avatarUrl: ''
+                    avatarUrl: '',
+                    isOnline: false,
+                    lastLoginText: ''
                 });
                 showToast(`User baru ${fullName} (ID: ${username}) berhasil ditambahkan!`, 'fa-user-plus', 'text-emerald-400');
             }
 
-            saveAuthData();
+            saveAuthData(true);
             updateHeaderAndSidebarAuthUI();
             renderMasterUser(document.getElementById('mainContent'));
         }
@@ -11379,11 +12143,13 @@
                     storeSub: 'YPC YOGYA PLAZA CIMAHI',
                     email: '',
                     phone: '',
-                    avatarUrl: ''
+                    avatarUrl: '',
+                    isOnline: false,
+                    lastLoginText: ''
                 });
             }
 
-            saveAuthData();
+            saveAuthData(true);
             updateHeaderAndSidebarAuthUI();
             closeModal();
             renderMasterUser(document.getElementById('mainContent'));
@@ -11402,24 +12168,255 @@
             if (currentUser && currentUser.id === id) {
                 currentUser = { ...yoplanoUsers[0] };
             }
-            saveAuthData();
+            saveAuthData(true);
             updateHeaderAndSidebarAuthUI();
             renderMasterUser(document.getElementById('mainContent'));
             showToast('User berhasil dihapus', 'fa-trash', 'text-rose-400');
         }
 
+        function ensureActiveSessionRecorded() {
+            if (!sessionStorage.getItem('yoplano_tab_session_v1') || !currentUser) return;
+            const nowStr = formatCurrentLoginTime();
+            const dev = detectUserDeviceLabel();
+            let changed = false;
+
+            if (!currentUser.lastDevice) {
+                currentUser.lastDevice = dev;
+                changed = true;
+            }
+            if (!currentUser.lastLoginText) {
+                currentUser.lastLoginText = nowStr;
+                changed = true;
+            }
+            if (!currentUser.isOnline) {
+                currentUser.isOnline = true;
+                changed = true;
+            }
+
+            const uIdx = yoplanoUsers.findIndex(u => u.id === currentUser.id);
+            if (uIdx !== -1) {
+                if (!yoplanoUsers[uIdx].isOnline || !yoplanoUsers[uIdx].lastDevice || !yoplanoUsers[uIdx].lastLoginText) {
+                    yoplanoUsers[uIdx].isOnline = true;
+                    yoplanoUsers[uIdx].lastDevice = yoplanoUsers[uIdx].lastDevice || currentUser.lastDevice;
+                    yoplanoUsers[uIdx].lastLoginText = yoplanoUsers[uIdx].lastLoginText || currentUser.lastLoginText;
+                    changed = true;
+                }
+            }
+
+            const hasActiveLog = yoplanoLoginLogs.some(l => l.userId === currentUser.id && l.status === 'ONLINE');
+            if (!hasActiveLog) {
+                yoplanoLoginLogs.unshift({
+                    logId: 'log_' + Date.now(),
+                    userId: currentUser.id,
+                    username: currentUser.username,
+                    fullName: currentUser.fullName,
+                    role: currentUser.role,
+                    storeCode: currentUser.storeCode || '205 - YPC YOGYA PLAZA CIMAHI',
+                    loginTime: currentUser.lastLoginText || nowStr,
+                    device: currentUser.lastDevice || dev,
+                    status: 'ONLINE'
+                });
+                changed = true;
+            }
+
+            if (changed) {
+                saveAuthData(true);
+            }
+        }
+
         // INITIALIZE APP
-        document.addEventListener('DOMContentLoaded', () => {
+        document.addEventListener('DOMContentLoaded', async () => {
             initDarkMode();
             loadAuthData();
+            if (yoplanoCloudDbUrl) {
+                await pullAuthDataFromCloud(true);
+            }
+            if (typeof pullCatalogFromMasterStock === 'function') {
+                await pullCatalogFromMasterStock(true);
+            }
+            ensureActiveSessionRecorded();
             updateHeaderAndSidebarAuthUI();
             if (typeof syncAutoSkuFromPlanogram === 'function') {
                 syncAutoSkuFromPlanogram(false);
             }
             navigateTo('dashboard');
-            if (!localStorage.getItem('yoplano_session_active_v1')) {
+            if (!sessionStorage.getItem('yoplano_tab_session_v1')) {
+                try { localStorage.removeItem('yoplano_session_active_v1'); } catch (e) {}
                 openLoginOverlay();
             }
+
+            // Jangan auto-logout saat sedang membuka dialog Print
+            window.addEventListener('beforeprint', () => { isYoPlanoPrinting = true; });
+            window.addEventListener('afterprint', () => { setTimeout(() => { isYoPlanoPrinting = false; }, 500); });
+
+            // Timer 5 menit saat berpindah tab / meminimalkan browser / pindah aplikasi di HP
+            let tabAwayLogoutTimer = null;
+            let tabHiddenSinceTs = 0;
+            const TAB_AWAY_TIMEOUT_MS = 5 * 60 * 1000; // 5 menit
+
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') {
+                    if (isYoPlanoPrinting || !sessionStorage.getItem('yoplano_tab_session_v1')) return;
+                    if (!tabHiddenSinceTs) tabHiddenSinceTs = Date.now();
+                    if (tabAwayLogoutTimer) clearTimeout(tabAwayLogoutTimer);
+                    tabAwayLogoutTimer = setTimeout(() => {
+                        if (document.visibilityState === 'hidden' && !isYoPlanoPrinting) {
+                            performAutoLogout('Anda otomatis logout karena meninggalkan halaman lebih dari 5 menit. Silakan login kembali.', true);
+                        }
+                    }, TAB_AWAY_TIMEOUT_MS);
+                } else if (document.visibilityState === 'visible') {
+                    if (tabAwayLogoutTimer) {
+                        clearTimeout(tabAwayLogoutTimer);
+                        tabAwayLogoutTimer = null;
+                    }
+                    if (tabHiddenSinceTs && (Date.now() - tabHiddenSinceTs >= TAB_AWAY_TIMEOUT_MS) && !isYoPlanoPrinting) {
+                        tabHiddenSinceTs = 0;
+                        performAutoLogout('Anda otomatis logout karena meninggalkan halaman lebih dari 5 menit. Silakan login kembali.', true);
+                    } else {
+                        tabHiddenSinceTs = 0;
+                    }
+                }
+            });
+
+            // Otomatis logout & set status OFFLINE jika menutup tab, menutup aplikasi/browser, atau mematikan PC/HP
+            window.addEventListener('pagehide', () => {
+                if (!isYoPlanoPrinting) {
+                    performAutoLogout('', true);
+                }
+            });
+            window.addEventListener('beforeunload', () => {
+                if (!isYoPlanoPrinting) {
+                    performAutoLogout('', true);
+                }
+            });
+
+            // Auto-refresh Cloud setiap 10 detik untuk memantau siapa saja yang sedang login & sync Master Stock
+            setInterval(() => {
+                if (yoplanoCloudDbUrl) {
+                    pullAuthDataFromCloud(true);
+                }
+                if (typeof pullCatalogFromMasterStock === 'function') {
+                    pullCatalogFromMasterStock(true);
+                }
+            }, 10000);
+        });
+    </script>
+
+    <!-- JEMBATAN SINKRONISASI REALTIME CLOUD FIRESTORE KE MASTER STOK (master-stok-app) -->
+    <script type="module">
+        import { initializeApp, getApps } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js';
+        import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-auth.js';
+        import { getFirestore, collection, doc, setDoc, getDocs, onSnapshot } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js';
+
+        const masterStokConfig = {
+            apiKey: 'AIzaSyA_WsBj9YEW1A8Qc532OQmYF4f6lxzelTQ',
+            authDomain: 'master-stok-app.firebaseapp.com',
+            projectId: 'master-stok-app',
+            storageBucket: 'master-stok-app.firebasestorage.app',
+            messagingSenderId: '125899842604',
+            appId: '1:125899842604:web:e4c683849c12c382dcdd89',
+            measurementId: 'G-LW58RVD3MJ'
+        };
+
+        const msApp = getApps().find(a => a.name === 'masterStokBridge') || initializeApp(masterStokConfig, 'masterStokBridge');
+        const msAuth = getAuth(msApp);
+        const msDb = getFirestore(msApp);
+        let msAuthPromise = null;
+
+        async function ensureMasterStokAuth() {
+            if (msAuth.currentUser) return msAuth.currentUser;
+            if (!msAuthPromise) {
+                msAuthPromise = signInAnonymously(msAuth)
+                    .then(cred => cred.user)
+                    .catch(err => { msAuthPromise = null; throw err; });
+            }
+            return msAuthPromise;
+        }
+
+        function mapDocToRaw(d) {
+            const data = d.data() || {};
+            return {
+                ...data,
+                id: data.id || d.id,
+                firestoreId: d.id,
+                plu: data.plu || data.plu8 || '',
+                pluKemasan: data.pluKemasan || data.packageBarcode || '',
+                division: data.division || data.divisi || 'FOOD',
+                category: data.category || data.kategori || 'GENERAL',
+                price: data.price ?? data.normalPrice ?? 0,
+                promoPrice: data.promoPrice ?? 0,
+                customImage: data.customImage || data.imageUrl || ''
+            };
+        }
+
+        window.yoplanoMasterStokFirestoreBridge = {
+            async pullAll() {
+                await ensureMasterStokAuth();
+                const snap = await getDocs(collection(msDb, 'master_products'));
+                return snap.docs.map(mapDocToRaw);
+            },
+            async pushCatalog(catalogList) {
+                await ensureMasterStokAuth();
+                const nowIso = new Date().toISOString();
+                const existingSnap = await getDocs(collection(msDb, 'master_products'));
+                const existingByPlu = new Map();
+                existingSnap.docs.forEach(d => {
+                    const dt = d.data() || {};
+                    const key = String(dt.plu || '').trim();
+                    if (key) existingByPlu.set(key, { docId: d.id, data: dt });
+                });
+
+                for (const item of (catalogList || [])) {
+                    if (!item || !item.plu8) continue;
+                    const match = existingByPlu.get(String(item.plu8).trim());
+                    const targetDocId = item.firestoreId || (match ? match.docId : ('yp_' + item.plu8));
+                    const prev = match ? match.data : {};
+
+                    const payload = {
+                        id: targetDocId,
+                        plu: String(item.plu8),
+                        pluKemasan: String(item.packageBarcode || prev.pluKemasan || item.plu8),
+                        name: String(item.name || prev.name || ''),
+                        price: Number(item.normalPrice) || 0,
+                        promoPrice: (Number(item.promoPrice) > 0) ? Number(item.promoPrice) : null,
+                        division: String(item.divisi || prev.division || 'FOOD'),
+                        category: String(item.category || prev.category || 'GENERAL'),
+                        unit: prev.unit || 'PCS',
+                        stock: typeof prev.stock === 'number' ? prev.stock : (typeof item.stockQty === 'number' ? item.stockQty : 0),
+                        customImage: item.imageUrl || prev.customImage || '',
+                        updatedAt: nowIso,
+                        sourceApp: 'YoPlano Ungu'
+                    };
+
+                    // Hanya tulis jika ada perubahan data agar tidak memicu loop sync berlebihan
+                    if (
+                        !match ||
+                        prev.name !== payload.name ||
+                        Number(prev.price || 0) !== payload.price ||
+                        Number(prev.promoPrice || 0) !== Number(payload.promoPrice || 0) ||
+                        prev.division !== payload.division ||
+                        prev.category !== payload.category ||
+                        prev.pluKemasan !== payload.pluKemasan
+                    ) {
+                        await setDoc(doc(msDb, 'master_products', targetDocId), payload, { merge: true });
+                    }
+                }
+                return true;
+            }
+        };
+
+        // Listener Realtime Firestore dari Master Stok -> YoPlano Ungu
+        ensureMasterStokAuth().then(() => {
+            onSnapshot(collection(msDb, 'master_products'), (snapshot) => {
+                const items = snapshot.docs.map(mapDocToRaw);
+                if (typeof window.applyIncomingMasterStockItems === 'function' && items.length > 0) {
+                    window.applyIncomingMasterStockItems(items, true);
+                }
+            }, (err) => {
+                console.warn('Master Stok Firestore listener error:', err);
+            });
+        }).catch(err => {
+            console.warn('Master Stok Firestore auth error:', err);
         });
     </script>
 </body>
