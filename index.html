@@ -10476,7 +10476,7 @@
             const name = String(raw.name || raw.nama || raw.nama_barang || raw.namaBarang || raw.article || raw.description || '').trim().toUpperCase();
             if (!name) return null;
 
-            const packageBarcode = String(raw.packageBarcode || raw.barcode || raw.barcode_kemasan || raw.ean || raw.tillCode || plu8).trim();
+            const packageBarcode = String(raw.packageBarcode || raw.pluKemasan || raw.barcode || raw.barcode_kemasan || raw.ean || raw.tillCode || plu8).trim();
             const divisi = String(raw.divisi || raw.division || 'FOOD').trim().toUpperCase() || 'FOOD';
             const category = String(raw.category || raw.kategori || 'GENERAL').trim().toUpperCase() || 'GENERAL';
             const normalPrice = Math.max(0, parseInt(raw.normalPrice ?? raw.harga_normal ?? raw.hargaNormal ?? raw.harga ?? raw.price ?? raw.salesPrice ?? 0) || 0);
@@ -10485,10 +10485,11 @@
             const promoEndDate = String(raw.promoEndDate || raw.akhir_promo || raw.endDate || raw.promoEnd || '').trim();
             const promoPeriod = String(raw.promoPeriod || raw.periode_promo || '').trim() ||
                 (typeof formatPromoPeriodRange === 'function' ? formatPromoPeriodRange(promoStartDate, promoEndDate) : '');
-            const imageUrl = String(raw.imageUrl || raw.gambar || raw.foto || raw.image || '').trim();
+            const imageUrl = String(raw.imageUrl || raw.customImage || raw.gambar || raw.foto || raw.image || '').trim();
 
             return {
                 id: String(raw.id || ('ms_' + plu8)),
+                firestoreId: String(raw.firestoreId || raw.id || ''),
                 artCode: String(raw.artCode || plu8),
                 plu8,
                 packageBarcode,
@@ -10506,83 +10507,102 @@
             };
         }
 
+        function applyIncomingMasterStockItems(rawItems, silent = true) {
+            if (!Array.isArray(rawItems) || rawItems.length === 0) return false;
+            let changed = false;
+            rawItems.forEach((raw, idx) => {
+                const mapped = normalizeMasterStockRecordToYoPlano(raw, idx);
+                if (!mapped) return;
+
+                if (Array.isArray(DIVISI_LIST) && !DIVISI_LIST.includes(mapped.divisi)) {
+                    DIVISI_LIST.push(mapped.divisi);
+                    changed = true;
+                }
+                if (typeof CATEGORIES_BY_DIVISI === 'object') {
+                    CATEGORIES_BY_DIVISI[mapped.divisi] = CATEGORIES_BY_DIVISI[mapped.divisi] || [];
+                    if (!CATEGORIES_BY_DIVISI[mapped.divisi].includes(mapped.category)) {
+                        CATEGORIES_BY_DIVISI[mapped.divisi].push(mapped.category);
+                        changed = true;
+                    }
+                }
+
+                const existingIdx = skuCatalog.findIndex(s => s.plu8 === mapped.plu8);
+                if (existingIdx !== -1) {
+                    const cur = skuCatalog[existingIdx];
+                    if (
+                        cur.name !== mapped.name ||
+                        cur.divisi !== mapped.divisi ||
+                        cur.category !== mapped.category ||
+                        Number(cur.normalPrice) !== Number(mapped.normalPrice) ||
+                        Number(cur.promoPrice) !== Number(mapped.promoPrice) ||
+                        (mapped.promoEndDate && cur.promoEndDate !== mapped.promoEndDate) ||
+                        (mapped.packageBarcode && cur.packageBarcode !== mapped.packageBarcode) ||
+                        (mapped.firestoreId && cur.firestoreId !== mapped.firestoreId)
+                    ) {
+                        skuCatalog[existingIdx] = {
+                            ...cur,
+                            ...mapped,
+                            id: cur.id,
+                            firestoreId: mapped.firestoreId || cur.firestoreId || cur.id,
+                            promoStartDate: mapped.promoStartDate || cur.promoStartDate || '',
+                            promoEndDate: mapped.promoEndDate || cur.promoEndDate || '',
+                            promoPeriod: mapped.promoPeriod || cur.promoPeriod || '',
+                            imageUrl: mapped.imageUrl || cur.imageUrl || ''
+                        };
+                        changed = true;
+                    }
+                } else {
+                    skuCatalog.push(mapped);
+                    changed = true;
+                }
+            });
+
+            if (changed) {
+                if (typeof persistPluTaxonomy === 'function') persistPluTaxonomy();
+                if (typeof syncAllPrintQueuesWithCatalog === 'function') syncAllPrintQueuesWithCatalog();
+                if (typeof syncAutoSkuFromPlanogram === 'function') syncAutoSkuFromPlanogram(false);
+                saveData(false);
+                if (activeView === 'plu-barcode-link') renderPluBarcodeLinkModule(document.getElementById('mainContent'));
+                else if (activeView === 'master-article') renderMasterArticle(document.getElementById('mainContent'));
+                else if (activeView === 'promotion') renderPromotionModule(document.getElementById('mainContent'));
+                else if (activeView === 'sku-category') renderSkuCategoryPage(document.getElementById('mainContent'));
+            }
+
+            if (!silent) {
+                showToast(`Sinkronisasi Master Stock berhasil (${skuCatalog.length} SKU aktif)!`, 'fa-arrows-rotate', 'text-emerald-400');
+            }
+            return true;
+        }
+
         async function pullCatalogFromMasterStock(silent = true) {
+            if (silent && (Date.now() - lastMasterStockWriteTs < 3000)) return false;
+
+            // Utamakan baca langsung dari Cloud Firestore Master Stok (master-stok-app -> master_products)
+            if (window.yoplanoMasterStokFirestoreBridge && typeof window.yoplanoMasterStokFirestoreBridge.pullAll === 'function') {
+                try {
+                    const fsItems = await window.yoplanoMasterStokFirestoreBridge.pullAll();
+                    if (Array.isArray(fsItems) && fsItems.length > 0) {
+                        return applyIncomingMasterStockItems(fsItems, silent);
+                    }
+                } catch (fsErr) {
+                    console.warn('Firestore Master Stok pull fallback:', fsErr);
+                }
+            }
+
             const url = getMasterStockDbUrl();
             if (!url) return false;
-            if (silent && (Date.now() - lastMasterStockWriteTs < 3000)) return false;
 
             try {
                 const res = await fetch(`${url}/.json?t=${Date.now()}`);
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const rootData = await res.json();
                 if (!rootData) {
-                    // Master Stock DB masih kosong, dorong katalog YoPlano saat ini sebagai data awal
                     await pushCatalogToMasterStock(true);
                     return true;
                 }
 
                 const rawItems = extractItemsArrayFromMasterStockPayload(rootData);
-                if (!rawItems || rawItems.length === 0) return false;
-
-                let changed = false;
-                rawItems.forEach((raw, idx) => {
-                    const mapped = normalizeMasterStockRecordToYoPlano(raw, idx);
-                    if (!mapped) return;
-
-                    // Pastikan Divisi & Kategori baru dari Master Stock otomatis terdaftar di YoPlano
-                    if (Array.isArray(DIVISI_LIST) && !DIVISI_LIST.includes(mapped.divisi)) {
-                        DIVISI_LIST.push(mapped.divisi);
-                        changed = true;
-                    }
-                    if (typeof CATEGORIES_BY_DIVISI === 'object') {
-                        CATEGORIES_BY_DIVISI[mapped.divisi] = CATEGORIES_BY_DIVISI[mapped.divisi] || [];
-                        if (!CATEGORIES_BY_DIVISI[mapped.divisi].includes(mapped.category)) {
-                            CATEGORIES_BY_DIVISI[mapped.divisi].push(mapped.category);
-                            changed = true;
-                        }
-                    }
-
-                    const existingIdx = skuCatalog.findIndex(s => s.plu8 === mapped.plu8);
-                    if (existingIdx !== -1) {
-                        const cur = skuCatalog[existingIdx];
-                        if (
-                            cur.name !== mapped.name ||
-                            cur.divisi !== mapped.divisi ||
-                            cur.category !== mapped.category ||
-                            Number(cur.normalPrice) !== Number(mapped.normalPrice) ||
-                            Number(cur.promoPrice) !== Number(mapped.promoPrice) ||
-                            (mapped.promoEndDate && cur.promoEndDate !== mapped.promoEndDate) ||
-                            (mapped.packageBarcode && cur.packageBarcode !== mapped.packageBarcode)
-                        ) {
-                            skuCatalog[existingIdx] = {
-                                ...cur,
-                                ...mapped,
-                                id: cur.id,
-                                imageUrl: mapped.imageUrl || cur.imageUrl || ''
-                            };
-                            changed = true;
-                        }
-                    } else {
-                        skuCatalog.push(mapped);
-                        changed = true;
-                    }
-                });
-
-                if (changed) {
-                    if (typeof persistPluTaxonomy === 'function') persistPluTaxonomy();
-                    if (typeof syncAllPrintQueuesWithCatalog === 'function') syncAllPrintQueuesWithCatalog();
-                    if (typeof syncAutoSkuFromPlanogram === 'function') syncAutoSkuFromPlanogram(false);
-                    saveData(false);
-                    if (activeView === 'plu-barcode-link') renderPluBarcodeLinkModule(document.getElementById('mainContent'));
-                    else if (activeView === 'master-article') renderMasterArticle(document.getElementById('mainContent'));
-                    else if (activeView === 'promotion') renderPromotionModule(document.getElementById('mainContent'));
-                    else if (activeView === 'sku-category') renderSkuCategoryPage(document.getElementById('mainContent'));
-                }
-
-                if (!silent) {
-                    showToast(`Sinkronisasi Master Stock berhasil (${skuCatalog.length} SKU aktif)!`, 'fa-arrows-rotate', 'text-emerald-400');
-                }
-                return true;
+                return applyIncomingMasterStockItems(rawItems, silent);
             } catch (err) {
                 if (!silent) {
                     showToast('Gagal membaca database Master Stock. Periksa Rules/koneksi internet.', 'fa-triangle-exclamation', 'text-amber-400');
@@ -10592,9 +10612,20 @@
         }
 
         async function pushCatalogToMasterStock(silent = true) {
-            const url = getMasterStockDbUrl();
-            if (!url) return false;
             lastMasterStockWriteTs = Date.now();
+            let pushedFirestore = false;
+
+            // Dorong ke Cloud Firestore Master Stok (master-stok-app -> master_products) agar sinkron dengan Master Stok & YoPule
+            if (window.yoplanoMasterStokFirestoreBridge && typeof window.yoplanoMasterStokFirestoreBridge.pushCatalog === 'function') {
+                try {
+                    pushedFirestore = await window.yoplanoMasterStokFirestoreBridge.pushCatalog(skuCatalog);
+                } catch (fsErr) {
+                    console.warn('Firestore Master Stok push error:', fsErr);
+                }
+            }
+
+            const url = getMasterStockDbUrl();
+            if (!url) return pushedFirestore;
             try {
                 const payloadItems = skuCatalog.map(item => ({
                     id: item.id,
@@ -10634,6 +10665,10 @@
                 }
                 return true;
             } catch (err) {
+                if (pushedFirestore) {
+                    if (!silent) showToast('Data harga & barang berhasil disinkronkan ke Master Stok Firestore!', 'fa-cloud-arrow-up', 'text-emerald-400');
+                    return true;
+                }
                 if (!silent) {
                     showToast('Gagal mengirim data ke Master Stock.', 'fa-triangle-exclamation', 'text-amber-400');
                 }
@@ -12264,6 +12299,124 @@
                     pullCatalogFromMasterStock(true);
                 }
             }, 10000);
+        });
+    </script>
+
+    <!-- JEMBATAN SINKRONISASI REALTIME CLOUD FIRESTORE KE MASTER STOK (master-stok-app) -->
+    <script type="module">
+        import { initializeApp, getApps } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js';
+        import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-auth.js';
+        import { getFirestore, collection, doc, setDoc, getDocs, onSnapshot } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js';
+
+        const masterStokConfig = {
+            apiKey: 'AIzaSyA_WsBj9YEW1A8Qc532OQmYF4f6lxzelTQ',
+            authDomain: 'master-stok-app.firebaseapp.com',
+            projectId: 'master-stok-app',
+            storageBucket: 'master-stok-app.firebasestorage.app',
+            messagingSenderId: '125899842604',
+            appId: '1:125899842604:web:e4c683849c12c382dcdd89',
+            measurementId: 'G-LW58RVD3MJ'
+        };
+
+        const msApp = getApps().find(a => a.name === 'masterStokBridge') || initializeApp(masterStokConfig, 'masterStokBridge');
+        const msAuth = getAuth(msApp);
+        const msDb = getFirestore(msApp);
+        let msAuthPromise = null;
+
+        async function ensureMasterStokAuth() {
+            if (msAuth.currentUser) return msAuth.currentUser;
+            if (!msAuthPromise) {
+                msAuthPromise = signInAnonymously(msAuth)
+                    .then(cred => cred.user)
+                    .catch(err => { msAuthPromise = null; throw err; });
+            }
+            return msAuthPromise;
+        }
+
+        function mapDocToRaw(d) {
+            const data = d.data() || {};
+            return {
+                ...data,
+                id: data.id || d.id,
+                firestoreId: d.id,
+                plu: data.plu || data.plu8 || '',
+                pluKemasan: data.pluKemasan || data.packageBarcode || '',
+                division: data.division || data.divisi || 'FOOD',
+                category: data.category || data.kategori || 'GENERAL',
+                price: data.price ?? data.normalPrice ?? 0,
+                promoPrice: data.promoPrice ?? 0,
+                customImage: data.customImage || data.imageUrl || ''
+            };
+        }
+
+        window.yoplanoMasterStokFirestoreBridge = {
+            async pullAll() {
+                await ensureMasterStokAuth();
+                const snap = await getDocs(collection(msDb, 'master_products'));
+                return snap.docs.map(mapDocToRaw);
+            },
+            async pushCatalog(catalogList) {
+                await ensureMasterStokAuth();
+                const nowIso = new Date().toISOString();
+                const existingSnap = await getDocs(collection(msDb, 'master_products'));
+                const existingByPlu = new Map();
+                existingSnap.docs.forEach(d => {
+                    const dt = d.data() || {};
+                    const key = String(dt.plu || '').trim();
+                    if (key) existingByPlu.set(key, { docId: d.id, data: dt });
+                });
+
+                for (const item of (catalogList || [])) {
+                    if (!item || !item.plu8) continue;
+                    const match = existingByPlu.get(String(item.plu8).trim());
+                    const targetDocId = item.firestoreId || (match ? match.docId : ('yp_' + item.plu8));
+                    const prev = match ? match.data : {};
+
+                    const payload = {
+                        id: targetDocId,
+                        plu: String(item.plu8),
+                        pluKemasan: String(item.packageBarcode || prev.pluKemasan || item.plu8),
+                        name: String(item.name || prev.name || ''),
+                        price: Number(item.normalPrice) || 0,
+                        promoPrice: (Number(item.promoPrice) > 0) ? Number(item.promoPrice) : null,
+                        division: String(item.divisi || prev.division || 'FOOD'),
+                        category: String(item.category || prev.category || 'GENERAL'),
+                        unit: prev.unit || 'PCS',
+                        stock: typeof prev.stock === 'number' ? prev.stock : (typeof item.stockQty === 'number' ? item.stockQty : 0),
+                        customImage: item.imageUrl || prev.customImage || '',
+                        updatedAt: nowIso,
+                        sourceApp: 'YoPlano Ungu'
+                    };
+
+                    // Hanya tulis jika ada perubahan data agar tidak memicu loop sync berlebihan
+                    if (
+                        !match ||
+                        prev.name !== payload.name ||
+                        Number(prev.price || 0) !== payload.price ||
+                        Number(prev.promoPrice || 0) !== Number(payload.promoPrice || 0) ||
+                        prev.division !== payload.division ||
+                        prev.category !== payload.category ||
+                        prev.pluKemasan !== payload.pluKemasan
+                    ) {
+                        await setDoc(doc(msDb, 'master_products', targetDocId), payload, { merge: true });
+                    }
+                }
+                return true;
+            }
+        };
+
+        // Listener Realtime Firestore dari Master Stok -> YoPlano Ungu
+        ensureMasterStokAuth().then(() => {
+            onSnapshot(collection(msDb, 'master_products'), (snapshot) => {
+                const items = snapshot.docs.map(mapDocToRaw);
+                if (typeof window.applyIncomingMasterStockItems === 'function' && items.length > 0) {
+                    window.applyIncomingMasterStockItems(items, true);
+                }
+            }, (err) => {
+                console.warn('Master Stok Firestore listener error:', err);
+            });
+        }).catch(err => {
+            console.warn('Master Stok Firestore auth error:', err);
         });
     </script>
 </body>
