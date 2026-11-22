@@ -1436,7 +1436,7 @@
             applyDarkModeState(savedDark === 'true');
         }
 
-        function saveData() {
+        function saveData(pushMasterStock = true) {
             // Save atomically per key and report quota/private-mode failures clearly.
             try {
                 const snapshot = {
@@ -1455,6 +1455,9 @@
                 Object.entries(snapshot).forEach(([key, value]) => localStorage.setItem(key, JSON.stringify(value)));
                 localStorage.setItem('yoplano_last_saved_at', new Date().toISOString());
                 updateStorageStatus();
+                if (pushMasterStock && typeof pushCatalogToMasterStock === 'function') {
+                    pushCatalogToMasterStock(true);
+                }
             } catch (error) {
                 console.error('YoPlano save failed:', error);
                 showToast('Penyimpanan browser gagal. Segera unduh backup data!', 'fa-triangle-exclamation', 'text-rose-400');
@@ -3362,6 +3365,10 @@
                         <h1 class="text-xl font-bold text-slate-800">Manajemen PLU 8 Digit, Divisi, & Kategori</h1>
                     </div>
                     <div class="flex flex-wrap items-center gap-2">
+                        <button onclick="syncMasterStockTwoWay(false)" class="bg-cyan-600 hover:bg-cyan-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow transition" title="Sinkronkan 2 Arah Harga & Barang dengan Master Stock">
+                            <i class="fa-solid fa-arrows-rotate"></i>
+                            <span>Sync Master Stock</span>
+                        </button>
                         <button onclick="triggerCsvImport()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow transition">
                             <i class="fa-solid fa-file-csv"></i>
                             <span>Import CSV PLU</span>
@@ -10406,11 +10413,238 @@
 
         // URL Cloud Database (Firebase Realtime Database) untuk sinkronisasi lintas perangkat
         const EMBEDDED_CLOUD_DB_URL = "https://yoplano-system-default-rtdb.asia-southeast1.firebasedatabase.app";
+        const EMBEDDED_MASTER_STOCK_URL = "https://master-stok-app-default-rtdb.asia-southeast1.firebasedatabase.app";
         let yoplanoCloudDbUrl = "";
+        let masterStockDbUrl = "";
+        let lastMasterStockWriteTs = 0;
         let yoplanoUsers = [];
         let yoplanoLoginLogs = [];
         let currentUser = null;
         let cloudSyncTimer = null;
+
+        function getMasterStockDbUrl() {
+            if (masterStockDbUrl) return masterStockDbUrl;
+            try {
+                masterStockDbUrl = normalizeCloudDbUrl(
+                    localStorage.getItem('yoplano_master_stock_db_url_v1') || EMBEDDED_MASTER_STOCK_URL || ''
+                );
+            } catch (e) {
+                masterStockDbUrl = normalizeCloudDbUrl(EMBEDDED_MASTER_STOCK_URL || '');
+            }
+            return masterStockDbUrl;
+        }
+
+        function isMasterStockItemObject(obj) {
+            if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+            return Boolean(
+                obj.plu8 || obj.plu || obj.kode_plu || obj.artCode || obj.kode ||
+                obj.name || obj.nama || obj.nama_barang || obj.namaBarang || obj.article || obj.description
+            );
+        }
+
+        function extractItemsArrayFromMasterStockPayload(rootData) {
+            if (!rootData || typeof rootData !== 'object') return [];
+            if (Array.isArray(rootData)) return rootData.filter(Boolean);
+
+            const priorityKeys = [
+                'yoplano_master_stock', 'master_stock', 'masterStock',
+                'sku_catalog', 'skuCatalog', 'catalog', 'items', 'products',
+                'barang', 'stok', 'stock', 'articles', 'data'
+            ];
+
+            for (const key of priorityKeys) {
+                const branch = rootData[key];
+                if (!branch) continue;
+                if (Array.isArray(branch)) return branch.filter(Boolean);
+                if (typeof branch === 'object') {
+                    if (Array.isArray(branch.items)) return branch.items.filter(Boolean);
+                    if (Array.isArray(branch.catalog)) return branch.catalog.filter(Boolean);
+                    const vals = Object.values(branch).filter(isMasterStockItemObject);
+                    if (vals.length > 0) return vals;
+                }
+            }
+
+            // Fallback: cek jika root langsung berisi map PLU/item
+            const rootVals = Object.values(rootData).filter(isMasterStockItemObject);
+            return rootVals;
+        }
+
+        function normalizeMasterStockRecordToYoPlano(raw, idx = 0) {
+            if (!raw || typeof raw !== 'object') return null;
+            const rawPlu = String(raw.plu8 || raw.plu || raw.kode_plu || raw.artCode || raw.kode || raw.id || '').trim();
+            const plu8 = /^\d{1,8}$/.test(rawPlu) ? rawPlu.padStart(8, '0') : (rawPlu || String(10000000 + idx));
+            const name = String(raw.name || raw.nama || raw.nama_barang || raw.namaBarang || raw.article || raw.description || '').trim().toUpperCase();
+            if (!name) return null;
+
+            const packageBarcode = String(raw.packageBarcode || raw.barcode || raw.barcode_kemasan || raw.ean || raw.tillCode || plu8).trim();
+            const divisi = String(raw.divisi || raw.division || 'FOOD').trim().toUpperCase() || 'FOOD';
+            const category = String(raw.category || raw.kategori || 'GENERAL').trim().toUpperCase() || 'GENERAL';
+            const normalPrice = Math.max(0, parseInt(raw.normalPrice ?? raw.harga_normal ?? raw.hargaNormal ?? raw.harga ?? raw.price ?? raw.salesPrice ?? 0) || 0);
+            const promoPrice = Math.max(0, parseInt(raw.promoPrice ?? raw.harga_promo ?? raw.hargaPromo ?? raw.promo ?? 0) || 0);
+            const promoStartDate = String(raw.promoStartDate || raw.mulai_promo || raw.startDate || '').trim();
+            const promoEndDate = String(raw.promoEndDate || raw.akhir_promo || raw.endDate || raw.promoEnd || '').trim();
+            const promoPeriod = String(raw.promoPeriod || raw.periode_promo || '').trim() ||
+                (typeof formatPromoPeriodRange === 'function' ? formatPromoPeriodRange(promoStartDate, promoEndDate) : '');
+            const imageUrl = String(raw.imageUrl || raw.gambar || raw.foto || raw.image || '').trim();
+
+            return {
+                id: String(raw.id || ('ms_' + plu8)),
+                artCode: String(raw.artCode || plu8),
+                plu8,
+                packageBarcode,
+                name,
+                divisi,
+                category,
+                normalPrice,
+                price: normalPrice,
+                promoPrice,
+                promoStartDate,
+                promoEndDate,
+                promoPeriod,
+                imageUrl,
+                stockQty: raw.stockQty ?? raw.stok ?? raw.qty ?? raw.stock ?? null
+            };
+        }
+
+        async function pullCatalogFromMasterStock(silent = true) {
+            const url = getMasterStockDbUrl();
+            if (!url) return false;
+            if (silent && (Date.now() - lastMasterStockWriteTs < 3000)) return false;
+
+            try {
+                const res = await fetch(`${url}/.json?t=${Date.now()}`);
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const rootData = await res.json();
+                if (!rootData) {
+                    // Master Stock DB masih kosong, dorong katalog YoPlano saat ini sebagai data awal
+                    await pushCatalogToMasterStock(true);
+                    return true;
+                }
+
+                const rawItems = extractItemsArrayFromMasterStockPayload(rootData);
+                if (!rawItems || rawItems.length === 0) return false;
+
+                let changed = false;
+                rawItems.forEach((raw, idx) => {
+                    const mapped = normalizeMasterStockRecordToYoPlano(raw, idx);
+                    if (!mapped) return;
+
+                    // Pastikan Divisi & Kategori baru dari Master Stock otomatis terdaftar di YoPlano
+                    if (Array.isArray(DIVISI_LIST) && !DIVISI_LIST.includes(mapped.divisi)) {
+                        DIVISI_LIST.push(mapped.divisi);
+                        changed = true;
+                    }
+                    if (typeof CATEGORIES_BY_DIVISI === 'object') {
+                        CATEGORIES_BY_DIVISI[mapped.divisi] = CATEGORIES_BY_DIVISI[mapped.divisi] || [];
+                        if (!CATEGORIES_BY_DIVISI[mapped.divisi].includes(mapped.category)) {
+                            CATEGORIES_BY_DIVISI[mapped.divisi].push(mapped.category);
+                            changed = true;
+                        }
+                    }
+
+                    const existingIdx = skuCatalog.findIndex(s => s.plu8 === mapped.plu8);
+                    if (existingIdx !== -1) {
+                        const cur = skuCatalog[existingIdx];
+                        if (
+                            cur.name !== mapped.name ||
+                            cur.divisi !== mapped.divisi ||
+                            cur.category !== mapped.category ||
+                            Number(cur.normalPrice) !== Number(mapped.normalPrice) ||
+                            Number(cur.promoPrice) !== Number(mapped.promoPrice) ||
+                            (mapped.promoEndDate && cur.promoEndDate !== mapped.promoEndDate) ||
+                            (mapped.packageBarcode && cur.packageBarcode !== mapped.packageBarcode)
+                        ) {
+                            skuCatalog[existingIdx] = {
+                                ...cur,
+                                ...mapped,
+                                id: cur.id,
+                                imageUrl: mapped.imageUrl || cur.imageUrl || ''
+                            };
+                            changed = true;
+                        }
+                    } else {
+                        skuCatalog.push(mapped);
+                        changed = true;
+                    }
+                });
+
+                if (changed) {
+                    if (typeof persistPluTaxonomy === 'function') persistPluTaxonomy();
+                    if (typeof syncAllPrintQueuesWithCatalog === 'function') syncAllPrintQueuesWithCatalog();
+                    if (typeof syncAutoSkuFromPlanogram === 'function') syncAutoSkuFromPlanogram(false);
+                    saveData(false);
+                    if (activeView === 'plu-barcode-link') renderPluBarcodeLinkModule(document.getElementById('mainContent'));
+                    else if (activeView === 'master-article') renderMasterArticle(document.getElementById('mainContent'));
+                    else if (activeView === 'promotion') renderPromotionModule(document.getElementById('mainContent'));
+                    else if (activeView === 'sku-category') renderSkuCategoryPage(document.getElementById('mainContent'));
+                }
+
+                if (!silent) {
+                    showToast(`Sinkronisasi Master Stock berhasil (${skuCatalog.length} SKU aktif)!`, 'fa-arrows-rotate', 'text-emerald-400');
+                }
+                return true;
+            } catch (err) {
+                if (!silent) {
+                    showToast('Gagal membaca database Master Stock. Periksa Rules/koneksi internet.', 'fa-triangle-exclamation', 'text-amber-400');
+                }
+                return false;
+            }
+        }
+
+        async function pushCatalogToMasterStock(silent = true) {
+            const url = getMasterStockDbUrl();
+            if (!url) return false;
+            lastMasterStockWriteTs = Date.now();
+            try {
+                const payloadItems = skuCatalog.map(item => ({
+                    id: item.id,
+                    plu8: item.plu8,
+                    plu: item.plu8,
+                    packageBarcode: item.packageBarcode || item.plu8,
+                    barcode: item.packageBarcode || item.plu8,
+                    name: item.name,
+                    nama: item.name,
+                    divisi: item.divisi,
+                    category: item.category,
+                    kategori: item.category,
+                    normalPrice: Number(item.normalPrice) || 0,
+                    harga: Number(item.normalPrice) || 0,
+                    promoPrice: Number(item.promoPrice) || 0,
+                    harga_promo: Number(item.promoPrice) || 0,
+                    promoStartDate: item.promoStartDate || '',
+                    promoEndDate: item.promoEndDate || '',
+                    promoPeriod: item.promoPeriod || '',
+                    imageUrl: item.imageUrl || '',
+                    updatedAt: new Date().toISOString()
+                }));
+
+                const res = await fetch(`${url}/yoplano_master_stock.json`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        items: payloadItems,
+                        source: 'YoPlano_Ungu',
+                        updatedAt: formatCurrentLoginTime(),
+                        updatedTs: Date.now()
+                    })
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                if (!silent) {
+                    showToast('Data harga & barang berhasil dikirim ke Master Stock!', 'fa-cloud-arrow-up', 'text-emerald-400');
+                }
+                return true;
+            } catch (err) {
+                if (!silent) {
+                    showToast('Gagal mengirim data ke Master Stock.', 'fa-triangle-exclamation', 'text-amber-400');
+                }
+                return false;
+            }
+        }
+
+        async function syncMasterStockTwoWay(silent = false) {
+            await pullCatalogFromMasterStock(true);
+            await pushCatalogToMasterStock(silent);
+        }
 
         function normalizeCloudDbUrl(rawUrl) {
             let clean = String(rawUrl || '').trim().replace(/\/+$/, '');
@@ -11962,6 +12196,9 @@
             if (yoplanoCloudDbUrl) {
                 await pullAuthDataFromCloud(true);
             }
+            if (typeof pullCatalogFromMasterStock === 'function') {
+                await pullCatalogFromMasterStock(true);
+            }
             ensureActiveSessionRecorded();
             updateHeaderAndSidebarAuthUI();
             if (typeof syncAutoSkuFromPlanogram === 'function') {
@@ -12018,10 +12255,13 @@
                 }
             });
 
-            // Auto-refresh Cloud setiap 10 detik untuk memantau siapa saja yang sedang login
+            // Auto-refresh Cloud setiap 10 detik untuk memantau siapa saja yang sedang login & sync Master Stock
             setInterval(() => {
                 if (yoplanoCloudDbUrl) {
                     pullAuthDataFromCloud(true);
+                }
+                if (typeof pullCatalogFromMasterStock === 'function') {
+                    pullCatalogFromMasterStock(true);
                 }
             }, 10000);
         });
