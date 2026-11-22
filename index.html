@@ -8744,13 +8744,14 @@
             const idx = skuCatalog.findIndex(s => s.plu8 === plu8);
             if (idx === -1) return;
 
+            const promoPeriodFields = typeof buildPromoPeriodFields === 'function'
+                ? buildPromoPeriodFields(promoPrice, promoStartDate, promoEndDate)
+                : { promoStartDate, promoEndDate, promoPeriod: '' };
             skuCatalog[idx].normalPrice = normalPrice;
             skuCatalog[idx].promoPrice = promoPrice;
-            skuCatalog[idx].promoStartDate = promoStartDate;
-            skuCatalog[idx].promoEndDate = promoEndDate;
-            if (typeof formatPromoPeriodRange === 'function') {
-                skuCatalog[idx].promoPeriod = formatPromoPeriodRange(promoStartDate, promoEndDate);
-            }
+            skuCatalog[idx].promoStartDate = promoPeriodFields.promoStartDate || promoStartDate;
+            skuCatalog[idx].promoEndDate = promoPeriodFields.promoEndDate || promoEndDate;
+            skuCatalog[idx].promoPeriod = promoPeriodFields.promoPeriod || '';
 
             promotionCampaignMap[plu8] = campaign;
             savePromotionCampaignData();
@@ -10573,10 +10574,15 @@
             const category = String(raw.category || raw.kategori || 'GENERAL').trim().toUpperCase() || 'GENERAL';
             const normalPrice = Math.max(0, parseInt(raw.normalPrice ?? raw.harga_normal ?? raw.hargaNormal ?? raw.harga ?? raw.price ?? raw.salesPrice ?? 0) || 0);
             const promoPrice = Math.max(0, parseInt(raw.promoPrice ?? raw.harga_promo ?? raw.hargaPromo ?? raw.promo ?? 0) || 0);
-            const promoStartDate = String(raw.promoStartDate || raw.mulai_promo || raw.startDate || '').trim();
-            const promoEndDate = String(raw.promoEndDate || raw.akhir_promo || raw.endDate || raw.promoEnd || '').trim();
-            const promoPeriod = String(raw.promoPeriod || raw.periode_promo || '').trim() ||
-                (typeof formatPromoPeriodRange === 'function' ? formatPromoPeriodRange(promoStartDate, promoEndDate) : '');
+            const rawPromoStart = String(raw.promoStartDate || raw.promoStart || raw.mulai_promo || raw.startDate || '').trim();
+            const rawPromoEnd = String(raw.promoEndDate || raw.promoEnd || raw.akhir_promo || raw.endDate || '').trim();
+            const rawPromoPeriod = String(raw.promoPeriod || raw.periode_promo || '').trim();
+            const periodFields = typeof buildPromoPeriodFields === 'function'
+                ? buildPromoPeriodFields(promoPrice, rawPromoStart, rawPromoEnd, rawPromoPeriod)
+                : { promoStartDate: rawPromoStart, promoEndDate: rawPromoEnd, promoPeriod: rawPromoPeriod };
+            const promoStartDate = periodFields.promoStartDate;
+            const promoEndDate = periodFields.promoEndDate;
+            const promoPeriod = periodFields.promoPeriod;
             const imageUrl = String(raw.imageUrl || raw.customImage || raw.gambar || raw.foto || raw.image || '').trim();
 
             return {
@@ -10627,7 +10633,9 @@
                         cur.category !== mapped.category ||
                         Number(cur.normalPrice) !== Number(mapped.normalPrice) ||
                         Number(cur.promoPrice) !== Number(mapped.promoPrice) ||
-                        (mapped.promoEndDate && cur.promoEndDate !== mapped.promoEndDate) ||
+                        String(cur.promoStartDate || '') !== String(mapped.promoStartDate || '') ||
+                        String(cur.promoEndDate || '') !== String(mapped.promoEndDate || '') ||
+                        String(cur.promoPeriod || '') !== String(mapped.promoPeriod || '') ||
                         (mapped.packageBarcode && cur.packageBarcode !== mapped.packageBarcode) ||
                         (mapped.firestoreId && cur.firestoreId !== mapped.firestoreId)
                     ) {
@@ -10636,9 +10644,9 @@
                             ...mapped,
                             id: cur.id,
                             firestoreId: mapped.firestoreId || cur.firestoreId || cur.id,
-                            promoStartDate: mapped.promoStartDate || cur.promoStartDate || '',
-                            promoEndDate: mapped.promoEndDate || cur.promoEndDate || '',
-                            promoPeriod: mapped.promoPeriod || cur.promoPeriod || '',
+                            promoStartDate: mapped.promoStartDate || '',
+                            promoEndDate: mapped.promoEndDate || '',
+                            promoPeriod: mapped.promoPeriod || '',
                             imageUrl: mapped.imageUrl || cur.imageUrl || ''
                         };
                         changed = true;
@@ -11388,12 +11396,12 @@
                                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                     <div>
                                         <label class="block text-xs font-extrabold text-slate-700 uppercase mb-1.5">ID User / Username Login *</label>
-                                        <input type="text" id="editProfileUsername" required value="${escapeHtml(currentUser.username || '')}" placeholder="Contoh: 224125043" class="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
+                                        <input type="text" id="editProfileUsername" autocomplete="off" required value="${escapeHtml(currentUser.username || '')}" placeholder="Contoh: 224125043" class="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
                                     </div>
                                     <div>
                                         <label class="block text-xs font-extrabold text-slate-700 uppercase mb-1.5">Password Baru (Opsional)</label>
                                         <div class="relative">
-                                            <input type="password" id="editProfilePassword" value="" placeholder="Kosongkan jika password tetap" class="w-full pl-3.5 pr-10 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
+                                            <input type="password" id="editProfilePassword" autocomplete="new-password" readonly onfocus="this.removeAttribute('readonly');" value="" placeholder="Kosongkan jika password tetap" class="w-full pl-3.5 pr-10 py-2.5 border border-slate-300 rounded-xl text-xs font-bold text-slate-800 font-mono focus:outline-none focus:border-indigo-500">
                                             <button type="button" onclick="const p=document.getElementById('editProfilePassword'); p.type = p.type==='password'?'text':'password';" class="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 text-xs">
                                                 <i class="fa-solid fa-eye"></i>
                                             </button>
@@ -12458,6 +12466,8 @@
                 category: data.category || data.kategori || 'GENERAL',
                 price: data.price ?? data.normalPrice ?? 0,
                 promoPrice: data.promoPrice ?? 0,
+                promoStart: data.promoStart || data.promoStartDate || '',
+                promoEnd: data.promoEnd || data.promoEndDate || '',
                 customImage: data.customImage || data.imageUrl || ''
             };
         }
@@ -12510,6 +12520,8 @@
                         name: String(item.name || prev.name || ''),
                         price: Number(item.normalPrice) || 0,
                         promoPrice: (Number(item.promoPrice) > 0) ? Number(item.promoPrice) : null,
+                        promoStart: String(item.promoStartDate || '').trim() || null,
+                        promoEnd: String(item.promoEndDate || '').trim() || null,
                         division: divName,
                         category: catName,
                         unit: prev.unit || 'PCS',
@@ -12525,6 +12537,8 @@
                         prev.name !== payload.name ||
                         Number(prev.price || 0) !== payload.price ||
                         Number(prev.promoPrice || 0) !== Number(payload.promoPrice || 0) ||
+                        String(prev.promoStart || '') !== String(payload.promoStart || '') ||
+                        String(prev.promoEnd || '') !== String(payload.promoEnd || '') ||
                         prev.division !== payload.division ||
                         prev.category !== payload.category ||
                         prev.pluKemasan !== payload.pluKemasan
