@@ -3350,6 +3350,7 @@
         // INPUT PLU & KATEGORI MODULE (DILENGKAPI IMPORT CSV & DOWNLOAD TEMPLATE RAPI)
         // =========================================================================
         function renderPluBarcodeLinkModule(container) {
+            const isMasterStockConnected = Boolean(window.yoplanoMasterStokFirestoreBridge || (typeof getMasterStockDbUrl === 'function' && getMasterStockDbUrl()));
             container.innerHTML = `
                 <div class="mb-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                     <div>
@@ -3360,7 +3361,13 @@
                             <span>/</span>
                             <span class="text-emerald-600 font-semibold">Input PLU & Kategori Per Divisi</span>
                         </div>
-                        <h1 class="text-xl font-bold text-slate-800">Manajemen PLU 8 Digit, Divisi, & Kategori</h1>
+                        <div class="flex flex-wrap items-center gap-2.5">
+                            <h1 class="text-xl font-bold text-slate-800">Manajemen PLU 8 Digit, Divisi, & Kategori</h1>
+                            ${isMasterStockConnected
+                                ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm" title="Tersambung realtime ke Cloud Master Stok"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span><i class="fa-solid fa-cloud-bolt"></i><span>Cloud Realtime Terhubung</span></span>`
+                                : `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-50 text-amber-700 border border-amber-200"><i class="fa-solid fa-laptop"></i><span>Mode Lokal</span></span>`
+                            }
+                        </div>
                     </div>
                     <div class="flex flex-wrap items-center gap-2">
                         <button onclick="pullCatalogFromMasterStock(false)" class="bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-lg text-xs font-semibold flex items-center space-x-2 shadow transition" title="Tarik Data PLU Terbaru dari Master Stok">
